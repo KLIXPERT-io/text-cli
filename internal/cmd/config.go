@@ -101,6 +101,13 @@ func newConfigListCmd() *cobra.Command {
 			rows := []output.Row{}
 			for _, k := range config.Keys() {
 				v, _ := cfg.Get(k)
+				// Listing every key is exactly what people paste into a bug
+				// report, so a credential is fingerprinted rather than
+				// printed. `config get firecrawl.api_key` still returns it in
+				// full — asking for one key by name is deliberate.
+				if config.Secret(k) {
+					v = config.Redact(v)
+				}
 				values[k] = v
 				rows = append(rows, output.Row{"key": k, "value": v})
 			}

@@ -2,7 +2,7 @@
 
 This CLI is built to grow. The design rule is **register, don't wire**: a new capability declares itself at init time and every consumer — the commands, `text metrics list`, `text lint rules`, the docs, `--metrics all` — picks it up from the same registry. There is no switch statement to update and no place where a list of features is repeated.
 
-There are **four** registries:
+There are **six** registries:
 
 | registry | package | adds | discovery command |
 |---|---|---|---|
@@ -10,8 +10,10 @@ There are **four** registries:
 | entity providers | [`internal/entity`](../internal/entity/provider.go) | an entity / sentiment / classification backend | `--provider` hint on error |
 | lint rules | [`internal/lint`](../internal/lint/lint.go) | a prose check | `text lint rules` |
 | knowledge sources | [`internal/knowledge`](../internal/knowledge/knowledge.go) | an encyclopedia backend | `--source` hint on error |
+| fetchers | [`internal/fetch`](../internal/fetch/fetch.go) | a URL-to-prose backend | `--fetcher` hint on error |
+| research sources | [`internal/research`](../internal/research/research.go) | a literature index | `--source` hint on error |
 
-Five recipes follow — the four registries, then a whole new command. All of them quote the actual signatures in this repo.
+Seven recipes follow — the six registries, then a whole new command. All of them quote the actual signatures in this repo.
 
 ---
 
@@ -576,7 +578,105 @@ func ParseWikipediaURL(raw string) (title, lang string, ok bool)
 
 ---
 
-## 5. Add a whole new command
+## 5. Add a fetcher
+
+**Cost: one new file. No command wiring.**
+
+A fetcher turns a URL into prose. It is what backs `text fetch` and the `--url` flag on every analysis command. The interface is in [`internal/fetch/fetch.go`](../internal/fetch/fetch.go):
+
+```go
+type Fetcher interface {
+	// Name is the stable identifier used by --fetcher and echoed in output.
+	Name() string
+	// Fetch reads one URL. A page that does not exist is errs.CodeNotFound.
+	Fetch(ctx context.Context, url string, opts Options) (*Page, error)
+}
+
+func Register(name string, factory func() (Fetcher, error))
+```
+
+Register it in an `init()` and it becomes the backend for `--fetcher <name>`, for `fetch.provider` in the config, and — if it is the only one registered — the default:
+
+```go
+const FetcherMine = "mine"
+
+func init() {
+	Register(FetcherMine, func() (Fetcher, error) { return &mineFetcher{}, nil })
+}
+```
+
+### Return markdown, not plain text
+
+This is the one substantive rule, and it is not a style preference. `State.LoadInput` runs every document through `internal/strip` before anything measures it, and that pass already knows how to reduce markdown to prose correctly. A backend that returns pre-flattened text hands the tokenizer a heading glued onto the sentence that follows it, which inflates average sentence length and moves the readability score — silently, on every page.
+
+Returning markdown is what makes `text readability --url X` and `text fetch X --output text | text readability` produce identical numbers. If those two disagree, this rule was broken.
+
+### Credentials go in a capability interface, not in `Options`
+
+`Options` is the whole contract, and everything in it is something *any* fetcher could act on: `MainContentOnly`, `IncludeLinks`, `MaxAge`, `Timeout`. An API key is not — a fetcher driving a local headless browser has none. So the credential arrives through an optional interface the command type-asserts for:
+
+```go
+type APIConfigurer interface {
+	SetAPIKey(key string)
+	SetBaseURL(url string)
+}
+```
+
+Implement it only if you need it. This is the same reasoning as `knowledge.TimeoutSetter`, and it is also what keeps factories cheap: the key is injected *after* construction, so `Register`'s "no credentials, no network" rule holds even though every backend needs one.
+
+### House rules for a fetcher
+
+- **A page with no text is `errs.CodeEmptyInput` with a hint**, never a `*Page` with an empty `Content`. A login wall must not reach a later command as a mysterious empty document.
+- **Leave fields out rather than lying with a zero value.** Only `URL` and `Content` are guaranteed; everything else is `omitempty`.
+- **Set `RequestedURL` only when it differs from `URL`.** Echoing the same string twice is noise in a format whose point is being compact.
+- **Validate the URL before spending a call.** `firecrawl.ValidateURL` rejects a non-http scheme locally, which is a better answer than a 400 relayed a second later.
+- **Make the base URL injectable** so tests point at an `httptest.Server`.
+
+---
+
+## 6. Add a research source
+
+**Cost: one new file. No command wiring.**
+
+A research source is a literature index. Searching is the only thing every source must do; reading one paper by id and finding related work are **capability interfaces**, exactly as sentiment and classification are for entity providers. The interfaces are in [`internal/research/research.go`](../internal/research/research.go):
+
+```go
+type Source interface {
+	Name() string
+	SearchPapers(ctx context.Context, opts SearchOptions) ([]Paper, error)
+}
+
+// Optional. Implement only what your index can actually do.
+type PaperInspector interface {
+	InspectPaper(ctx context.Context, id string, opts InspectOptions) (*PaperDetail, error)
+}
+type SimilarFinder interface {
+	SimilarPapers(ctx context.Context, id string, opts SimilarOptions) ([]Paper, error)
+}
+```
+
+An index built from titles and abstracts alone implements `Source` and stops there. `text research paper` then fails with a `provider_unavailable` error that **names the sources that would have worked** — because `InspectorSources()` constructs every registered source just to type-assert on it. That is only affordable because factories are cheap, which is why `Register` forbids clients, credentials, and network calls inside one.
+
+Never add a method to `Source` to accommodate one backend.
+
+### Identifiers are namespaced, and unknown ones resolve to nothing
+
+`Paper.PrimaryID` is `arxiv:1706.03762`, `doi:10.1145/3442188`, `pmid:18027780`, `pmcid:PMC1431743`. Two rules follow:
+
+- **A bare id is rejected, not guessed.** `NormalizeID("1706.03762")` is an `invalid_args` error, because that string is as plausibly a PMID as an arXiv id and guessing would be wrong about half the time.
+- **`LandingURL` returns `""` for a namespace it does not know.** A guessed URL in cited output is worse than no URL. Add a namespace to the switch rather than constructing one at the call site.
+
+### House rules for a source
+
+- **Return `[]Paper{}`, never `nil`.** An empty result renders as `[]` rather than `null`, so a consumer can iterate without a nil check.
+- **`Score` is comparable within one result set and meaningless across two.** The search ranking and the similar-papers ranking are different scales — which is why nothing in this repo thresholds on it.
+- **Dates are strings, verbatim.** The indexes behind one source are not uniform (an RFC 1123 arXiv timestamp next to a bare `YYYY-MM-DD`), and normalising to `time.Time` would mean discarding the ones that do not parse.
+- **`Authors` is one string, not a parsed list.** Splitting it would invent a structure the source does not guarantee.
+- **Require a key only if you truly need one.** The Firecrawl source deliberately does *not* call `firecrawl.RequireKey`: the index answers unauthenticated requests, and demanding a key would fail calls that would have succeeded.
+
+---
+
+## 7. Add a whole new command
 
 **Cost: one new file plus one line.**
 
@@ -592,6 +692,8 @@ root.AddCommand(
 	newDiffCmd(),
 	newLintCmd(),
 	newKBCmd(),
+	newFetchCmd(),
+	newResearchCmd(),
 	newConfigCmd(),
 	newUpdateCmd(version),
 )
@@ -699,6 +801,9 @@ Then add `newWordsCmd(),` to the `AddCommand` list. That is the entire wiring.
 | an optional provider capability | `internal/entity/provider.go` | a new interface plus a `RequireX` — never a method on `Provider` |
 | a lint rule | one file (or one `Register` call) in `internal/lint/` | none — `lint.Register` in `init()` |
 | a knowledge database | one file in `internal/knowledge/` | none — `knowledge.Register` in `init()` |
+| a URL-to-prose backend | one file in `internal/fetch/` | none — `fetch.Register` in `init()` |
+| a literature index | one file in `internal/research/` | none — `research.Register` in `init()` |
+| an optional research capability | `internal/research/research.go` | a new interface plus a `RequireX` — never a method on `Source` |
 | a command | one file in `internal/cmd/` | one line in `Execute` |
 | a config key | `internal/config/config.go` | add to the struct, `Get`, `Set`, and `Keys()` |
 | an output format | `internal/output/output.go` | add to `Format`, `Valid`, and the switch in `emitResult` |

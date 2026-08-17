@@ -18,6 +18,13 @@ internal/entity/               provider-neutral entity types + registry + Google
                                  backend; sentiment.go and classify.go hold the
                                  optional capability interfaces
 internal/knowledge/            knowledge-source registry + Wikipedia backend
+internal/firecrawl/            shared Firecrawl HTTP client: key resolution and
+                                 error translation, no domain types
+internal/fetch/                Fetcher registry + Firecrawl scrape backend;
+                                 backs `text fetch` and the global --url
+internal/research/             research-source registry + Firecrawl papers
+                                 backend; SearchPapers is required, inspect and
+                                 related-work are capability interfaces
 internal/strip/                Markdown / HTML → prose, with format sniffing
 internal/textproc/             tokenizer: sentences, words, syllables, per language
 internal/input/                stdin / file / args resolution, text|lines|jsonl
@@ -28,21 +35,23 @@ internal/errs/                 structured errors and exit codes
 internal/cache/                disk cache with TTLs
 internal/logging/              stderr logging
 internal/update/               self-updater
-docs/EXTENDING.md              the five extension recipes — read before adding anything
+docs/EXTENDING.md              the seven extension recipes — read before adding anything
 skills/text-cli/SKILL.md       agent skill shipped with the CLI
 ```
 
-Commands: `readability`, `lint` (+ `lint rules`), `diff`, `metrics`, `entities`, `sentiment`, `classify`, `kb` (+ `lookup`, `search`), `config`, `update`.
+Commands: `readability`, `lint` (+ `lint rules`), `diff`, `metrics`, `entities`, `sentiment`, `classify`, `kb` (+ `lookup`, `search`), `fetch`, `research` (+ `papers`, `paper`, `similar`), `config`, `update`.
 
 ## The one rule: register, don't wire
 
-New capabilities declare themselves; nothing enumerates them. There are **four** registries, and they all work the same way:
+New capabilities declare themselves; nothing enumerates them. There are **six** registries, and they all work the same way:
 
 - **A metric** — one file in `internal/analyze/readability/` (or a new package under `internal/analyze/`) with `analyze.Register(analyze.Metric{...})` in `init()`. It then appears in `text metrics list`, in `--metrics all`, and in `--metrics auto` for its declared languages.
   **The one manual step:** add it to the `directions` table in `internal/analyze/readability/wstf.go`. `readability.DirectionOf` is what `text diff` and the `--fail-under` / `--fail-over` gates read to decide whether up or down is better; a metric missing from it is silently skipped by a gate. `TestDirectionOf` walks `analyze.All()` and fails the build if you forget.
 - **A lint rule** — `lint.Register(lint.Rule{...})` in `init()`, in `internal/lint/rules_*.go`. It appears in `text lint rules` and is selected by `--rules auto` for its languages. A rule *name* may be registered more than once for **disjoint** languages (German `passive` and English `passive` are different detectors under one name); overlapping languages panic at init.
 - **An entity provider** — one file in `internal/entity/` with `entity.Register(name, factory)` in `init()`. Only `Name()` and `AnalyzeEntities` are required. Sentiment and classification are **capability interfaces** (`SentimentAnalyzer`, `TextClassifier`) that a backend implements only if it can; commands ask via `RequireSentiment` / `RequireClassifier` and get a `provider_unavailable` error naming the backends that would have worked. Never add a method to `Provider`.
 - **A knowledge source** — one file in `internal/knowledge/` with `knowledge.Register(name, factory)` in `init()`. Backs `text kb` and `text entities --enrich`.
+- **A fetcher** — one file in `internal/fetch/` with `fetch.Register(name, factory)` in `init()`. Backs `text fetch` and the global `--url`. **It must return markdown, not plain text**: `State.LoadInput` runs every document through `internal/strip`, and a backend that pre-flattens hands the tokenizer a heading glued to the next sentence. That is what makes `--url` and `text fetch … | text …` produce identical scores and identical byte offsets. The API key arrives via the `APIConfigurer` capability interface, not via `Options` — a local headless-browser fetcher has no key.
+- **A research source** — one file in `internal/research/` with `research.Register(name, factory)` in `init()`. `SearchPapers` is the only required method; `PaperInspector` and `SimilarFinder` are capability interfaces, asked for via `RequireInspector` / `RequireSimilarFinder`. Never add a method to `Source`.
 
 Every factory must stay cheap — no clients, no credentials, no network; `Open` calls it lazily, and `SentimentProviders()` constructs every registered provider just to type-assert on it.
 
@@ -62,7 +71,8 @@ If you find yourself editing more than one file to add a feature of these kinds,
 - **Tests are table-driven.** One `tests := []struct{...}` slice, `t.Run(tc.name, ...)`, cases named for the behaviour they pin. Test the `internal/` package, not the cobra command, wherever the logic can be lifted out of `RunE`.
 - **Language gates are load-bearing.** A metric's or rule's `Languages` field is what stops German prose being scored with English constants. Set it honestly; use `AnyLanguage` (`"*"`) only for genuinely language-agnostic work.
 - **Do not clamp scores**, only band labels — and only where the scale really ends. Reading ease clamps to 0–100 for the *label*; grade levels do not clamp, and a WSTF outside 4–15 is labelled `unter der Skala` / `über der Skala` rather than pretending to be `sehr leicht`.
-- **Paid calls are cached on the provider's inputs, never on the filters.** `entities`/`sentiment`/`classify` key on (provider, language, text), so changing `--top`, `--types`, or `--min-salience` re-filters a cached payload instead of paying again. Keep it that way.
+- **Paid calls are cached on the provider's inputs, never on the filters.** `entities`/`sentiment`/`classify` key on (provider, language, text), so changing `--top`, `--types`, or `--min-salience` re-filters a cached payload instead of paying again. `fetch` keys on (fetcher, URL, main-content, links) — deliberately *not* on `MaxAge`, which bounds staleness in Firecrawl's cache rather than in this one; including it would write two entries for one page. Keep it that way.
+- **Credentials come from the environment and the config, never from a flag.** There is no `--api-key`: a secret on the command line lands in shell history and in the process list. `config.Secret`/`config.Redact` fingerprint the key in `text config list`, because that output is what people paste into bug reports; `config get` still returns it in full.
 - **German is domain vocabulary, not localisation.** Amstad and WSTF level labels, and the German lint messages and suggestions, stay in German because that is what the formulas and the style guides call them. Do not translate them and do not add an i18n layer.
 - **Comments explain why, not what.** The existing files are the style reference: they justify the constants, the fallbacks, and the design choices, and skip narrating the code.
 

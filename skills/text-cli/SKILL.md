@@ -1,25 +1,26 @@
 ---
 name: text-cli
-description: Analyse and improve text from the command line with the `text` CLI — readability scoring (Flesch, Amstad, WSTF, LIX, Flesch-Kincaid, Gunning Fog, SMOG, Coleman-Liau, ARI), a lint engine that reports what to fix with exact byte offsets, before/after diffing of drafts, named-entity extraction with salience and Wikipedia identifiers, sentiment, content classification, and Wikipedia lookups. Use whenever the task involves how readable, hard, or complex a piece of writing is, making a text simpler or clearer, comparing drafts, checking prose against a reading level in CI, counting words/sentences/syllables, pulling people, places, organizations and products out of text, ranking what a document or a corpus is about, how a text feels, what category it belongs to, or looking a named thing up in an encyclopedia. Triggers include "how readable is this", "reading level", "Flesch score", "Lesbarkeit", "Lesbarkeitsindex", "simplify this text", "make this easier to read", "is this too hard to read", "rewrite this more clearly", "Passiv vermeiden", "Behördendeutsch", "Substantivstil", "lint my prose", "did my rewrite help", "compare these two drafts", "extract entities", "who and what is mentioned", "named entities", "what is this text about", "main topics", "salience", "sentiment of this review", "is this positive or negative", "classify this article", "look this up on Wikipedia", "word count of this article".
+description: Analyse and improve text from the command line with the `text` CLI — readability scoring (Flesch, Amstad, WSTF, LIX, Flesch-Kincaid, Gunning Fog, SMOG, Coleman-Liau, ARI), a lint engine that reports what to fix with exact byte offsets, before/after diffing of drafts, named-entity extraction with salience and Wikipedia identifiers, sentiment, content classification, Wikipedia lookups, scraping any web page to clean prose, and scientific-literature search. Use whenever the task involves how readable, hard, or complex a piece of writing is, making a text simpler or clearer, comparing drafts, checking prose against a reading level in CI, counting words/sentences/syllables, pulling people, places, organizations and products out of text, ranking what a document or a corpus is about, how a text feels, what category it belongs to, looking a named thing up in an encyclopedia, reading or analysing a web page by URL, or finding scientific papers on a topic. Triggers include "how readable is this", "reading level", "Flesch score", "Lesbarkeit", "Lesbarkeitsindex", "simplify this text", "make this easier to read", "is this too hard to read", "rewrite this more clearly", "Passiv vermeiden", "Behördendeutsch", "Substantivstil", "lint my prose", "did my rewrite help", "compare these two drafts", "extract entities", "who and what is mentioned", "named entities", "what is this text about", "main topics", "salience", "sentiment of this review", "is this positive or negative", "classify this article", "look this up on Wikipedia", "word count of this article", "read this URL", "scrape this page", "analyse this web page", "how readable is this article <url>", "find papers about", "what does the research say", "related work", "cite a paper".
 ---
 
 # text — text analysis CLI
 
 `text` reads prose from stdin, a file, or an argument and prints structured data. It never writes anything but its output.
 
-Commands: `readability`, `lint` (+ `lint rules`), `diff`, `metrics list|show`, `entities`, `sentiment`, `classify`, `kb lookup|search`, `config`, `update`.
+Commands: `readability`, `lint` (+ `lint rules`), `diff`, `metrics list|show`, `entities`, `sentiment`, `classify`, `kb lookup|search`, `fetch`, `research papers|paper|similar`, `config`, `update`.
 
-Cost: `readability`, `lint`, `diff`, `metrics` are pure local computation and free. `kb` needs the network but no credentials. `entities`, `sentiment`, `classify` call Google Cloud Natural Language and are billed per request.
+Cost: `readability`, `lint`, `diff`, `metrics` are pure local computation and free. `kb` and `research` need the network but no credentials. `entities`, `sentiment`, `classify` call Google Cloud Natural Language and are billed per request. `fetch` and `--url` call Firecrawl and are billed per page — but cached 24h, so analysing one page three ways costs one scrape.
 
 ## Input
 
 Precedence, fixed for every command:
 
-1. `--file <path>` (`-` means stdin)
-2. positional arguments, joined into one document
-3. piped or redirected stdin
+1. `--url <url>` (repeatable) — the page is fetched, then treated exactly like a file
+2. `--file <path>` (`-` means stdin)
+3. positional arguments, joined into one document
+4. piped or redirected stdin
 
-A terminal stdin with no arguments is an `empty_input` error, not a hang. Prefer `--file` over `cat file | text …`.
+A terminal stdin with no arguments is an `empty_input` error, not a hang. Prefer `--file` over `cat file | text …`, and `--url` over `text fetch … | text …`.
 
 Batch input: `--input-format lines` (one document per line) or `--input-format jsonl` (one JSON object per line; `--text-field`, default `text`, and `--id-field`, default `id`). Sidecar JSONL fields are carried through into NDJSON output, so results join back to the source. Pair batches with `--output ndjson`.
 
@@ -256,6 +257,50 @@ text entities --file post.md --top 10 --output ndjson | jq -r .name | text kb lo
 
 Or skip the pipe entirely with `text entities --enrich`, which uses the `wikipedia_url` the provider already returned and therefore resolves the right article and the right language edition.
 
+## Web pages
+
+```bash
+text fetch <url...>          # aliases: scrape, read
+text readability --url <url> # or entities, lint, sentiment, classify, diff — any command
+```
+
+`--url` is an input source, not a separate workflow. **Prefer it over piping**: `text entities --url X` is one command, hits the same cache, and gives each document the URL as its `id` instead of `0`.
+
+A `Page` has `url` (after redirects), `requested_url` (only when it differs), `title`, `description`, `language` (the page's *declared* language — a hint, not an answer), `content` (markdown), `links` (with `--links`), `status_code`, `fetcher`, `credits`.
+
+- **`--output text` prints only the page content**, which is what makes `text fetch X --output text | text …` safe. Any other format wraps it in the envelope.
+- **Check `status_code`.** A scrape can succeed at fetching a 404 page; the fetch worked, the page is an error page.
+- **A page with no text is `empty_input` (exit 5) with a hint**, not an empty result. If the hint suggests `--main-content=false`, that means the boilerplate extractor probably ate the body — retry with it.
+- **`--refresh` bypasses both caches**, this CLI's and Firecrawl's, so you actually get a fresh page.
+- Multiple URLs are fetched concurrently. A dead link in a batch is a stderr warning; a missing API key or a rate limit aborts, because it would repeat for every remaining URL.
+
+## Research — scientific literature
+
+```bash
+text research papers <query...>   # search
+text research paper <id>          # one paper, optionally with passages
+text research similar <id>        # related work
+```
+
+No credentials required. Cached 24h. arXiv, PubMed, and DOI-addressed work behind one id scheme.
+
+**Ids are namespaced**: `arxiv:1706.03762`, `doi:10.1145/3442188`, `pmid:18027780`, `pmcid:PMC1431743`. A bare number is an `invalid_args` error, not a guess — it is as likely a PMID as an arXiv id. Get an id from the `id` / `primary_id` field of a search result; never invent one.
+
+A `Paper` has `id`, `primary_id`, `ids` (every external identifier, by namespace), `title`, `abstract`, `authors` (one string, not a list), `categories`, `published`, `updated`, `score`, `url`.
+
+- **The query is embedded, not keyword-matched.** A question retrieves better than a keyword list.
+- **`score` is comparable within one result set and meaningless across two.** Never threshold on it, and never compare a search score to a `similar` score.
+- `papers` filters: `--limit` (default 10, capped at 100), `--authors`, `--categories` (e.g. `cs.LG`), `--from` / `--to` (`YYYY-MM-DD`).
+- `paper --query "<question>"` also returns the passages of the full text most relevant to that question — this is what makes it usable as a source rather than just a citation. Without `--query` you get the record alone.
+- `similar --intent "<what makes a neighbour interesting>"` is **required**. "Papers like this" is ambiguous until you say whether you mean the method, the application, or the dataset. `--relation similar|citers|references` picks the direction: same subject, later work citing it, or its own bibliography.
+
+Abstracts are prose, so they feed the rest of the CLI:
+
+```bash
+text research papers "readability formulas" --limit 20 --output ndjson |
+  jq -r .abstract | text entities --input-format lines --aggregate --top 20
+```
+
 ## Batching
 
 Do not loop the CLI once per document when the documents are already in a file. Build JSONL and make one call:
@@ -279,7 +324,9 @@ find content -name '*.md' -print0 \
 
 For `entities`, `sentiment`, and `classify` only, highest precedence first: `--service-account`, `TEXT_SERVICE_ACCOUNT`, `GOOGLE_APPLICATION_CREDENTIALS`, config `entities.service_account_path`, then Application Default Credentials. On exit 2, read the hint — it names the console page. The Cloud Natural Language API must be enabled on the project.
 
-`readability`, `lint`, `diff`, `metrics`, and `kb` need no credentials at all.
+For `fetch` and `--url`: `FIRECRAWL_API_KEY`, then config `firecrawl.api_key`. There is no `--api-key` flag by design. On exit 2 the hint names the dashboard page — stop and tell the user, do not retry.
+
+`readability`, `lint`, `diff`, `metrics`, `kb`, and `research` need no credentials at all.
 
 ## Rules of thumb
 
@@ -291,6 +338,10 @@ For `entities`, `sentiment`, and `classify` only, highest precedence first: `--s
 - Set `--lang` explicitly when you know the language; detection is a heuristic and `meta.language_detected` tells you when it was used.
 - Rank entities by `salience`, never by `probability`, and keep thresholds in the 0.01–0.1 range.
 - Reach for `entities` / `sentiment` / `classify` only when the task actually needs them — they are the only commands that spend money. Readability and lint questions never do.
+- Given a URL, use `--url` on the command you actually want rather than `text fetch | …`. Same cache, fewer moving parts, and the document id becomes the URL.
+- Do not re-fetch a page you already fetched in this session — it is cached for 24h, so a second command against the same URL is free. Do not add `--refresh` unless the page is expected to have changed.
+- For "what does the research say about X", `text research papers` first, then `text research paper <id> --query "<the actual question>"` on the best hits. Quote the abstract or a passage, and cite the `url`.
+- Never invent a paper id or a DOI. Take it from a search result's `primary_id`.
 - `--output toon` when the result goes into a prompt, `--output json` when it goes into `jq`.
 - On exit 5, run `text metrics list` or `text lint rules` before retrying; on exit 2, stop and tell the user which credential is missing rather than retrying.
 - Large batches: write NDJSON to a file and query it with `jq`, do not read every line into context.

@@ -88,7 +88,7 @@ func runLint(cmd *cobra.Command, args []string, o lintOptions) error {
 		return errs.Newf(errs.CodeInvalidArgs, "unknown severity: %q", o.severity).
 			WithHint("Use --severity info (everything) or --severity warn (only the warnings).")
 	}
-	items, err := s.LoadInput(args)
+	items, err := s.LoadInput(cmd.Context(), args)
 	if err != nil {
 		return err
 	}

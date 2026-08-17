@@ -11,7 +11,9 @@ A fast, LLM-friendly Go CLI for text analysis. It reads prose from stdin, a file
 - Also `ndjson` for streams, `csv` for spreadsheets, `table` on a TTY, `text` for humans.
 - Structured errors with machine-readable codes and distinct exit codes — never a stack trace, never a hang. `--fail-under` / `--fail-over` / `--fail-on-findings` turn any of it into a CI gate.
 - Named entities, sentiment, and content classification via the Google Cloud Natural Language API, behind a provider interface built for more backends. Wikipedia lookups via `text kb`, with no credentials at all.
-- Four registries — metrics, entity providers, lint rules, knowledge sources — so a new measurement, rule, or backend is one file that wires itself.
+- **`--url` reads the web.** `text fetch` scrapes any page to clean prose via Firecrawl, and every analysis command takes `--url` directly — so `text entities --url https://…` works without a pipe. Pages are cached, so analysing one page three ways costs one scrape.
+- **`text research`** searches scientific literature (arXiv, PubMed, DOI) and returns abstracts — which are prose, so the rest of the CLI composes straight onto them.
+- Six registries — metrics, entity providers, lint rules, knowledge sources, fetchers, research sources — so a new measurement, rule, or backend is one file that wires itself.
 - Local disk cache with TTLs, so re-running a paid analysis over unchanged text costs nothing.
 - Single static binary, no runtime, no daemon.
 
@@ -80,6 +82,21 @@ Those three call the [Google Cloud Natural Language API v1](https://cloud.google
 
    A path that is configured but does not exist is an `auth_missing` error rather than a silent fallback to ADC, so a typo surfaces immediately instead of as a confusing permission error later.
 
+### Firecrawl credentials (only for `--url` and `text fetch`)
+
+Fetching a page calls [Firecrawl](https://firecrawl.dev)'s scrape API, which renders JavaScript, follows redirects, and returns markdown rather than a tag soup. Get a key from the [dashboard](https://firecrawl.dev/app/api-keys), then set it either way — environment first, config second:
+
+```bash
+export FIRECRAWL_API_KEY=fc-...
+text config set firecrawl.api_key fc-...
+```
+
+There is deliberately no `--api-key` flag: a credential on the command line lands in shell history and in the process list. `text config list` prints the key as a fingerprint (`…f017f`) rather than in full, because that output is what people paste into bug reports; `text config get firecrawl.api_key` still returns it.
+
+Self-hosting Firecrawl? Point the CLI at it with `text config set firecrawl.base_url http://localhost:3002`.
+
+`text research` uses the same account but does **not** require a key — the literature index answers unauthenticated requests. Setting one raises your rate limit.
+
 Check the [language support table](https://cloud.google.com/natural-language/docs/languages) before trusting output in a long-tail language. The v1 API rejects a language it does not support with an error rather than answering best-effort, so for the Google backend `language_supported` in the response is always `true`; the field stays in the contract for providers that report it.
 
 ## Usage
@@ -94,6 +111,8 @@ Check the [language support table](https://cloud.google.com/natural-language/doc
 | `sentiment` (`sent`) | polarity, magnitude, and a label, optionally per sentence |
 | `classify` (`cls`) | content categories as taxonomy paths |
 | `kb lookup\|search` (`knowledge`) | Wikipedia descriptions and lead paragraphs |
+| `fetch` (`scrape`, `read`) | a web page as clean prose, ready for any other command |
+| `research papers\|paper\|similar` | scientific literature search, one paper by id, related work |
 | `config get\|set\|list\|path` | configuration |
 | `update status\|check\|apply` | self-update |
 
@@ -127,6 +146,17 @@ text classify --file post.md --top 3
 text kb lookup "Ada Lovelace"
 text kb search "analytical engine"
 
+# The web (Firecrawl API key required)
+text fetch https://example.com/post
+text fetch https://example.com/post --output text | text entities
+text readability --url https://example.com/post   # same thing, no pipe
+text lint --url https://example.com/post
+
+# Scientific literature (no credentials required)
+text research papers "how is text readability measured?"
+text research paper arxiv:1706.03762 --query "what is the attention mechanism?"
+text research similar arxiv:1706.03762 --intent "cheaper attention variants"
+
 # Config and self-update
 text config path
 text config list
@@ -135,9 +165,10 @@ text update status
 
 Input precedence is fixed and identical for every command:
 
-1. `--file <path>` (or `--file -` for stdin)
-2. positional arguments, joined into one document
-3. stdin, when it is a pipe or a redirect
+1. `--url <url>` (repeatable) — fetched, then treated exactly like a file
+2. `--file <path>` (or `--file -` for stdin)
+3. positional arguments, joined into one document
+4. stdin, when it is a pipe or a redirect
 
 A terminal stdin with no arguments is an `empty_input` error, not a hang. The CLI never silently waits for a human to type.
 
@@ -149,6 +180,9 @@ A terminal stdin with no arguments is an `empty_input` error, not a hang. The CL
 | `--strip auto\|markdown\|html\|none` | reduce markup to prose before analysis; default `auto` |
 | `--lang auto\|en\|de` | analysis language; `auto` detects it |
 | `-f, --file <path>` | read the text from a file (`-` for stdin) |
+| `--url <url>` | fetch a web page and analyse it; repeatable |
+| `--fetcher <name>` | backend for `--url` and `text fetch` (default `firecrawl`) |
+| `--main-content` | drop nav, headers, and footers from a fetched page (default true) |
 | `--input-format text\|lines\|jsonl` | one document, one per line, or one JSON object per line |
 | `--text-field <name>` | JSONL field holding the text (default `text`) |
 | `--id-field <name>` | JSONL field holding the document id (default `id`) |
@@ -301,6 +335,69 @@ text entities --file post.md --top 5 --enrich
 `--aggregate` produces `combined_salience` (the sum of the per-document salience — read it as a count, bounded by the number of documents rather than by 1.0), `avg_salience`, `mentions`, and `documents`. Merging keys on the case-folded name **plus** the type, so "Apple" the ORGANIZATION and "apple" the CONSUMER_GOOD stay apart.
 
 **Filter composition matters.** `--types` and the salience threshold are per-document statements and apply **before** the merge; `--sort` and `--top` are statements about the final list and apply **after** it. `--enrich` runs after filtering too, so no Wikipedia lookup is paid for an entity `--top` was about to discard, and it is ignored with `--aggregate` (a merged entity has no single article). All of this happens after the cache, so tightening a filter never costs another API call.
+
+## The web as input
+
+Every command reads stdin, a file, or an argument. `--url` adds a fourth source: the page is scraped to clean prose and then treated exactly like a file — same stripping, same language detection, same output envelope.
+
+```bash
+# The page, as prose
+text fetch https://example.com/post
+text fetch https://example.com/post --output text      # just the text, for a pipe
+text fetch https://example.com/post --links            # plus outbound links
+
+# Analyse a page directly — no pipe, no temp file
+text readability --url https://example.com/post
+text entities --url https://example.com/post --min-salience 0.02
+text lint --url https://example.com/post --output text
+
+# Several pages at once; each result carries its URL as the document id
+text fetch https://a.com/x https://b.com/y --output ndjson
+text readability --url https://a.com/x --url https://b.com/y --output csv
+```
+
+Two details worth knowing:
+
+- **The fetcher returns markdown, not plain text**, and the CLI's own `--strip` pass reduces it to prose. That is not incidental: a scraper's text extraction flattens a heading into the sentence that follows it, which inflates average sentence length and moves the score. Letting the existing strip pass do the work means `--url` and `cat page.md |` produce identical numbers, byte offsets included.
+- **Pages are cached for 24h**, keyed on the URL and the options that change the returned text — not on your output format or filters. Analysing one page for readability, entities, and lint costs one scrape. `--refresh` re-reads it, and also bypasses Firecrawl's own cache so you actually get a fresh page rather than their stored copy.
+
+A page that yields no text — a login wall, a canvas app — is an `empty_input` error naming the likely cause, not a silently empty document that a later command reports as a mystery.
+
+## Research: the literature
+
+`text kb` answers "what is this thing?" from an encyclopedia. `text research` answers "what has been published about it?" from a paper index spanning arXiv, PubMed, and DOI-addressed work.
+
+```bash
+# Search. The query is embedded, not keyword-matched, so a question works better
+text research papers "how is text readability measured?"
+text research papers "diffusion image synthesis" --limit 20 --categories cs.LG
+text research papers "attention" --from 2017-01-01 --to 2018-01-01 --output csv
+
+# One paper, with the passages that answer a question
+text research paper arxiv:1706.03762
+text research paper arxiv:1706.03762 --query "what is the attention mechanism?"
+
+# Related work, in either direction
+text research similar arxiv:1706.03762 --intent "cheaper attention variants"
+text research similar arxiv:1706.03762 --intent "vision applications" --relation citers
+text research similar arxiv:1706.03762 --intent "sequence models" --relation references
+```
+
+Ids are namespaced — `arxiv:1706.03762`, `doi:10.1145/3442188`, `pmid:18027780`, `pmcid:PMC1431743`. A bare number is rejected rather than guessed: it is as likely a PMID as an arXiv id.
+
+`--intent` on `similar` is required and is the point of the command. "Papers like this one" is ambiguous until you say what makes them alike — the method, the application, or the dataset — and the ranking is built from that sentence.
+
+Abstracts are prose, so the rest of the CLI composes onto them:
+
+```bash
+# How readable is the literature on readability?
+text research papers "readability formulas" --limit 20 --output ndjson |
+  jq -r .abstract | text readability --metrics flesch --output csv
+
+# Who and what does a field talk about?
+text research papers "sepsis biomarkers" --limit 25 --output ndjson |
+  jq -r .abstract | text entities --input-format lines --aggregate --top 20
+```
 
 ## Pipelines
 
@@ -534,10 +631,22 @@ provider = "google"
 service_account_path = "~/secrets/text-sa.json"
 # language = "de"   # force the document language sent to the provider
 
+[firecrawl]
+api_key = "fc-..."          # or export FIRECRAWL_API_KEY, which wins
+# base_url = "http://localhost:3002"   # a self-hosted Firecrawl
+
+[fetch]
+# provider = "firecrawl"    # empty lets the registry pick
+
+[research]
+# source = "firecrawl"      # empty lets the registry pick
+
 [cache]
 # dir = "~/custom/cache"   # default: <config dir>/cache
 default_ttl = "24h"
 ttl_entities = "24h"
+ttl_fetch = "24h"
+ttl_research = "24h"
 
 [logging]
 verbose = false
@@ -548,9 +657,11 @@ Manage it with `text config get|set|list|path`. `text config list` prints every 
 
 The `entities` section also governs `sentiment` and `classify`: they share the provider, the credential chain, and `cache.ttl_entities`. Knowledge lookups (`text kb`, `--enrich`) use the same cache directory with a fixed 24h TTL; `--cache-ttl` overrides it per call.
 
+The `firecrawl` section is shared by `text fetch`, `--url`, and `text research` — one account, one quota. `FIRECRAWL_API_KEY` beats the config file, so CI can override a stored key without editing it. `text config list` fingerprints the key rather than printing it.
+
 ## Roadmap / extending
 
-The registries are the point. There are four, and each follows the same rule — **register, don't wire**:
+The registries are the point. There are six, and each follows the same rule — **register, don't wire**:
 
 | registry | package | what it adds |
 |---|---|---|
@@ -558,18 +669,20 @@ The registries are the point. There are four, and each follows the same rule —
 | entity providers | `internal/entity` | an entity backend, optionally sentiment and classification via capability interfaces |
 | lint rules | `internal/lint` | a check, visible in `text lint rules` and selected by `--rules auto` for its languages |
 | knowledge sources | `internal/knowledge` | a database behind `text kb` and `text entities --enrich` |
+| fetchers | `internal/fetch` | a way to turn a URL into prose, behind `text fetch` and `--url` |
+| research sources | `internal/research` | a literature index behind `text research`, with optional inspect and related-work capabilities |
 
 Each is one file with a `Register` call in `init()`: no command wiring, no switch statement, no list of features repeated anywhere.
 
-Shipped since 0.1.0: the lint engine, `diff`, `sentiment`, `classify`, ten more metrics, Markdown/HTML stripping, TOON output, and — no longer "planned" — **knowledge-database lookups**, with Wikipedia as the first source behind `text kb` and `text entities --enrich`.
+Shipped since 0.1.0: the lint engine, `diff`, `sentiment`, `classify`, ten more metrics, Markdown/HTML stripping, TOON output, knowledge-database lookups behind `text kb`, and — newest — **the web as an input source** (`text fetch`, `--url`) and **literature search** (`text research`), both on Firecrawl.
 
 Still ahead:
 
 - **More metrics.** Further readability formulas, and measurements beyond readability.
 - **More lint rules**, and rule packs for languages beyond English and German.
-- **More backends.** A second knowledge source (Wikidata, an internal database) lands as a registration, not a rewrite.
+- **More backends.** A second knowledge source (Wikidata, an internal database), a credential-free fetcher for static pages, or a second literature index — each lands as a registration, not a rewrite.
 
-See [docs/EXTENDING.md](./docs/EXTENDING.md) for the four extension recipes, with the real signatures from this repo.
+See [docs/EXTENDING.md](./docs/EXTENDING.md) for the extension recipes, with the real signatures from this repo.
 
 ## Non-goals
 
