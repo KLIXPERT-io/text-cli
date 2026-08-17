@@ -81,7 +81,7 @@ Invoked as ` + "`text flesch`" + ` or ` + "`text amstad`" + ` it defaults to tha
 func runReadability(cmd *cobra.Command, args []string, metricsFlag string, withStats bool, gates []gate) error {
 	s := getState(cmd)
 
-	items, err := s.LoadInput(args)
+	items, err := s.LoadInput(cmd.Context(), args)
 	if err != nil {
 		return err
 	}

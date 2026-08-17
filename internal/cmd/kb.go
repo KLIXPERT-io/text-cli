@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -87,7 +86,7 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			s := getState(cmd)
 
-			titles, err := s.loadTitles(args)
+			titles, err := s.loadTitles(cmd.Context(), args)
 			if err != nil {
 				return err
 			}
@@ -153,7 +152,7 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			s := getState(cmd)
 
-			items, err := s.LoadInput(args)
+			items, err := s.LoadInput(cmd.Context(), args)
 			if err != nil {
 				return err
 			}
@@ -237,7 +236,7 @@ func resolveKBLanguage(s *State) string {
 // exists for is `... | jq -r .name | text kb lookup`, and treating that as a
 // single multi-line title would be useless. An explicit --input-format still
 // wins, so --input-format jsonl --text-field name also works.
-func (s *State) loadTitles(args []string) ([]string, error) {
+func (s *State) loadTitles(ctx context.Context, args []string) ([]string, error) {
 	if len(args) > 0 {
 		titles := make([]string, 0, len(args))
 		for _, a := range args {
@@ -253,12 +252,14 @@ func (s *State) loadTitles(args []string) ([]string, error) {
 	}
 
 	// A copy: the default upgrade is scoped to this call and must not leak into
-	// the shared state a later command reads.
+	// the shared state a later command reads. --url is dropped for the same
+	// reason it is in `research`: a whole fetched page is not a list of titles.
 	st := *s
+	st.URLs = nil
 	if st.InputFormat == "" || input.Format(st.InputFormat) == input.FormatText {
 		st.InputFormat = string(input.FormatLines)
 	}
-	items, err := st.LoadInput(nil)
+	items, err := st.LoadInput(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -498,10 +499,7 @@ func kbMeta(srcName, lang string, documents int, stats kbStats) output.Meta {
 	return meta
 }
 
-func isNotFound(err error) bool {
-	var e *errs.E
-	return errors.As(err, &e) && e.Code == errs.CodeNotFound
-}
+func isNotFound(err error) bool { return isCode(err, errs.CodeNotFound) }
 
 // articleRows is the CSV/table shape: the four fields that identify an article.
 // The extract is deliberately absent — a paragraph in a CSV cell is unreadable,

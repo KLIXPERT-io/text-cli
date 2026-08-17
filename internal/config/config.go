@@ -37,10 +37,31 @@ type Entities struct {
 	Language string `toml:"language"`
 }
 
+// Firecrawl holds the credential shared by every Firecrawl-backed feature: the
+// page fetcher and the research source. It is one section rather than a key
+// under each because it is one account and one quota.
+type Firecrawl struct {
+	APIKey string `toml:"api_key"`
+	// BaseURL points at a self-hosted Firecrawl. Empty uses the public API.
+	BaseURL string `toml:"base_url"`
+}
+
+// Fetch names the backend `text fetch` and `--url` read pages through.
+type Fetch struct {
+	Provider string `toml:"provider"`
+}
+
+// Research names the backend `text research` searches.
+type Research struct {
+	Source string `toml:"source"`
+}
+
 type Cache struct {
 	Dir         string `toml:"dir"`
 	DefaultTTL  string `toml:"default_ttl"`
 	TTLEntities string `toml:"ttl_entities"`
+	TTLFetch    string `toml:"ttl_fetch"`
+	TTLResearch string `toml:"ttl_research"`
 }
 
 type Logging struct {
@@ -49,21 +70,29 @@ type Logging struct {
 }
 
 type Config struct {
-	Defaults   Defaults `toml:"defaults"`
-	Entities   Entities `toml:"entities"`
-	Cache      Cache    `toml:"cache"`
-	Logging    Logging  `toml:"logging"`
-	AutoUpdate bool     `toml:"auto_update"`
+	Defaults   Defaults  `toml:"defaults"`
+	Entities   Entities  `toml:"entities"`
+	Firecrawl  Firecrawl `toml:"firecrawl"`
+	Fetch      Fetch     `toml:"fetch"`
+	Research   Research  `toml:"research"`
+	Cache      Cache     `toml:"cache"`
+	Logging    Logging   `toml:"logging"`
+	AutoUpdate bool      `toml:"auto_update"`
 	// Path the config was loaded from (empty if defaults).
 	path string
 }
 
 // Default returns built-in defaults.
+//
+// fetch.provider and research.source are deliberately empty rather than
+// "firecrawl": the registries resolve an unset name to their single registered
+// backend, so a config written today does not pin a choice that a second
+// backend would need to un-pin.
 func Default() *Config {
 	return &Config{
 		Defaults:   Defaults{Output: "", Lang: "auto", Metrics: "auto"},
 		Entities:   Entities{Provider: "google"},
-		Cache:      Cache{DefaultTTL: "24h", TTLEntities: "24h"},
+		Cache:      Cache{DefaultTTL: "24h", TTLEntities: "24h", TTLFetch: "24h", TTLResearch: "24h"},
 		Logging:    Logging{Format: "text"},
 		AutoUpdate: true,
 	}
@@ -158,6 +187,15 @@ func (c *Config) TTL() time.Duration { return parseTTL(c.Cache.DefaultTTL, 24*ti
 // entities.
 func (c *Config) EntitiesTTL() time.Duration { return parseTTL(c.Cache.TTLEntities, 24*time.Hour) }
 
+// FetchTTL returns the cache TTL for fetched pages. Scrapes are billed per
+// request and a page's prose does not change hour to hour, so the default
+// matches entities'. --refresh is the escape hatch for a page that did change.
+func (c *Config) FetchTTL() time.Duration { return parseTTL(c.Cache.TTLFetch, 24*time.Hour) }
+
+// ResearchTTL returns the cache TTL for literature queries. A paper's abstract
+// is immutable and the index moves in days, not minutes.
+func (c *Config) ResearchTTL() time.Duration { return parseTTL(c.Cache.TTLResearch, 24*time.Hour) }
+
 func parseTTL(v string, fallback time.Duration) time.Duration {
 	d, err := time.ParseDuration(strings.TrimSpace(v))
 	if err != nil || d <= 0 {
@@ -181,12 +219,24 @@ func (c *Config) Get(key string) (string, bool) {
 		return c.Entities.ServiceAccountPath, true
 	case "entities.language":
 		return c.Entities.Language, true
+	case "firecrawl.api_key":
+		return c.Firecrawl.APIKey, true
+	case "firecrawl.base_url":
+		return c.Firecrawl.BaseURL, true
+	case "fetch.provider":
+		return c.Fetch.Provider, true
+	case "research.source":
+		return c.Research.Source, true
 	case "cache.dir":
 		return c.Cache.Dir, true
 	case "cache.default_ttl":
 		return c.Cache.DefaultTTL, true
 	case "cache.ttl_entities":
 		return c.Cache.TTLEntities, true
+	case "cache.ttl_fetch":
+		return c.Cache.TTLFetch, true
+	case "cache.ttl_research":
+		return c.Cache.TTLResearch, true
 	case "logging.verbose":
 		return fmt.Sprintf("%v", c.Logging.Verbose), true
 	case "logging.format":
@@ -215,6 +265,14 @@ func (c *Config) Set(key, value string) error {
 		c.Entities.ServiceAccountPath = value
 	case "entities.language":
 		c.Entities.Language = value
+	case "firecrawl.api_key":
+		c.Firecrawl.APIKey = strings.TrimSpace(value)
+	case "firecrawl.base_url":
+		c.Firecrawl.BaseURL = strings.TrimSpace(value)
+	case "fetch.provider":
+		c.Fetch.Provider = value
+	case "research.source":
+		c.Research.Source = value
 	case "cache.dir":
 		c.Cache.Dir = value
 	case "cache.default_ttl":
@@ -227,6 +285,16 @@ func (c *Config) Set(key, value string) error {
 			return fmt.Errorf("invalid duration: %q", value)
 		}
 		c.Cache.TTLEntities = value
+	case "cache.ttl_fetch":
+		if _, err := time.ParseDuration(value); err != nil {
+			return fmt.Errorf("invalid duration: %q", value)
+		}
+		c.Cache.TTLFetch = value
+	case "cache.ttl_research":
+		if _, err := time.ParseDuration(value); err != nil {
+			return fmt.Errorf("invalid duration: %q", value)
+		}
+		c.Cache.TTLResearch = value
 	case "logging.verbose":
 		c.Logging.Verbose = value == "true" || value == "1"
 	case "logging.format":
@@ -263,13 +331,44 @@ func Keys() []string {
 		"entities.provider",
 		"entities.service_account_path",
 		"entities.language",
+		"firecrawl.api_key",
+		"firecrawl.base_url",
+		"fetch.provider",
+		"research.source",
 		"cache.dir",
 		"cache.default_ttl",
 		"cache.ttl_entities",
+		"cache.ttl_fetch",
+		"cache.ttl_research",
 		"logging.verbose",
 		"logging.format",
 		"auto_update",
 	}
+}
+
+// Secret reports whether a key holds a credential that must not be printed in
+// full.
+//
+// It exists because `text config list` prints every value, and that output is
+// exactly what people paste into a bug report. `text config get
+// firecrawl.api_key` still returns the real value — asking for one key by name
+// is deliberate, listing them all is not.
+func Secret(key string) bool {
+	return key == "firecrawl.api_key"
+}
+
+// Redact renders a secret as a fingerprint: enough to tell two keys apart or
+// confirm which one is loaded, not enough to use.
+func Redact(value string) string {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return ""
+	}
+	const tail = 4
+	if len(v) <= tail {
+		return strings.Repeat("*", len(v))
+	}
+	return "…" + v[len(v)-tail:]
 }
 
 // ExpandHome expands a leading ~ in paths.

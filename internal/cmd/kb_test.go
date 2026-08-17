@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -367,9 +369,29 @@ func TestKBLookupTitlesFromStdinLines(t *testing.T) {
 	if len(docs) != 2 {
 		t.Fatalf("documents = %v, want one per non-empty line", docs)
 	}
-	if fakeKB.lookups[0] != "Ada Lovelace/en" || fakeKB.lookups[1] != "Charles Babbage/en" {
-		t.Fatalf("lookups = %v", fakeKB.lookups)
+	// The *output* is in request order — kbLookupMany reassembles it that way,
+	// and that is the guarantee a consumer relies on.
+	if got := docs[0].(map[string]any)["title"]; got != "Ada Lovelace" {
+		t.Errorf("documents[0].title = %v, want the first line", got)
 	}
+	if got := docs[1].(map[string]any)["title"]; got != "Charles Babbage" {
+		t.Errorf("documents[1].title = %v, want the second line", got)
+	}
+	// The order the *lookups* happened in is deliberately not asserted: they
+	// run on a pool of concurrent workers, so which one reaches the source
+	// first is scheduling, not behaviour. Assert the set instead — that both
+	// lines became a lookup, and the blank line did not.
+	if got := sortedCopy(fakeKB.lookups); !reflect.DeepEqual(got, []string{"Ada Lovelace/en", "Charles Babbage/en"}) {
+		t.Fatalf("lookups = %v, want exactly one per non-empty line", got)
+	}
+}
+
+// sortedCopy sorts a copy, so an assertion on a set does not reorder the slice
+// a later assertion in the same test might read.
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
 }
 
 func TestKBLookupSingleMissIsNotFound(t *testing.T) {

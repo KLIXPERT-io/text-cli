@@ -8,16 +8,19 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/KLIXPERT-io/text-cli/internal/cache"
 	"github.com/KLIXPERT-io/text-cli/internal/config"
 	"github.com/KLIXPERT-io/text-cli/internal/errs"
+	"github.com/KLIXPERT-io/text-cli/internal/fetch"
 	"github.com/KLIXPERT-io/text-cli/internal/input"
 	"github.com/KLIXPERT-io/text-cli/internal/logging"
 	"github.com/KLIXPERT-io/text-cli/internal/output"
@@ -49,6 +52,14 @@ type State struct {
 	MaxBytes    int64
 	Strip       string
 
+	// URL input. --url is a third input source alongside --file and stdin,
+	// not a per-command flag: it is resolved inside LoadInput with the other
+	// two, so every command reads a web page through one path and none of
+	// them can disagree about what the document is.
+	URLs        []string
+	Fetcher     string
+	MainContent bool
+
 	Verbose   bool
 	Quiet     bool
 	LogFormat string
@@ -65,23 +76,22 @@ func getState(cmd *cobra.Command) *State {
 	return s
 }
 
-// LoadInput resolves the documents to analyse from flags, args, and stdin, and
-// reduces markup to prose before anything measures it.
+// LoadInput resolves the documents to analyse from flags, args, stdin, and
+// --url, and reduces markup to prose before anything measures it.
 //
 // Stripping happens here, once, rather than in each command: scoring a fenced
 // code block or a URL as if it were a sentence is simply wrong, and a command
 // that forgot to strip would report a confidently incorrect number. Defaulting
 // to auto-detection means `cat post.md | text readability` is right without a
 // flag; --strip none opts out.
-func (s *State) LoadInput(args []string) ([]input.Item, error) {
-	items, err := input.Load(input.Options{
-		Args:      args,
-		File:      s.File,
-		Format:    input.Format(s.InputFormat),
-		TextField: s.TextField,
-		IDField:   s.IDField,
-		MaxBytes:  s.MaxBytes,
-	})
+//
+// A fetched page goes through the same strip pass as a piped file, which is
+// the reason the fetcher returns markdown rather than plain text: the page
+// arrives as markup and is reduced by the code that already knows how, instead
+// of by a scraper's text extraction that would flatten headings into the
+// following sentence.
+func (s *State) LoadInput(ctx context.Context, args []string) ([]input.Item, error) {
+	items, err := s.loadRaw(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -98,6 +108,80 @@ func (s *State) LoadInput(args []string) ([]input.Item, error) {
 		}
 	}
 	return items, nil
+}
+
+// loadRaw resolves the input source before stripping. --url wins over the
+// other sources when it is set, so `text entities --url X < some.txt` analyses
+// the page rather than silently preferring the redirect.
+func (s *State) loadRaw(ctx context.Context, args []string) ([]input.Item, error) {
+	if len(s.URLs) == 0 {
+		return input.Load(input.Options{
+			Args:      args,
+			File:      s.File,
+			Format:    input.Format(s.InputFormat),
+			TextField: s.TextField,
+			IDField:   s.IDField,
+			MaxBytes:  s.MaxBytes,
+		})
+	}
+
+	urls, err := s.loadURLs(nil)
+	if err != nil {
+		return nil, err
+	}
+	pages, stats, err := s.fetchPages(ctx, urls, s.fetchOptions())
+	if err != nil {
+		return nil, err
+	}
+	if len(pages) == 0 {
+		if stats.firstErr != nil {
+			return nil, stats.firstErr
+		}
+		return nil, errs.New(errs.CodeEmptyInput, "no page could be fetched").
+			WithHint("Check the URL loads in a browser, or try --no-main-content.")
+	}
+
+	items := make([]input.Item, 0, len(pages))
+	for _, p := range pages {
+		if p == nil {
+			continue
+		}
+		text, truncated := capText(p.Content, s.MaxBytes)
+		// The URL is the document id, not an index: a batch of three pages is
+		// far more useful in NDJSON when each row says which page it came
+		// from. Title and URL ride along as passthrough fields for the same
+		// reason JSONL input's do — so output can be joined back to its source.
+		item := input.Item{ID: p.URL, Text: text, Truncated: truncated}
+		item.Fields = map[string]any{"url": p.URL}
+		if p.Title != "" {
+			item.Fields["title"] = p.Title
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// capText applies --max-bytes to fetched text, which otherwise bypasses the
+// limit that every other input source honours.
+//
+// It cuts on a rune boundary: a page truncated mid-UTF-8-sequence would hand
+// the tokenizer an invalid byte, and the resulting word count would be wrong in
+// a way nothing downstream could detect.
+func capText(s string, max int64) (string, bool) {
+	if max <= 0 || int64(len(s)) <= max {
+		return s, false
+	}
+	cut := int(max)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut], true
+}
+
+// isCode reports whether err is an *errs.E carrying the given code.
+func isCode(err error, code errs.Code) bool {
+	var e *errs.E
+	return errors.As(err, &e) && e.Code == code
 }
 
 // Language returns the requested analysis language, honoring --lang then
@@ -143,13 +227,19 @@ rather than into jq, which cannot parse it.
 Markdown and HTML are reduced to prose before anything is measured, so a
 fenced code block or a URL never counts as a sentence. --strip none opts out.
 
+--url fetches a web page and analyses that, so any command that reads a file
+also reads a URL. Pages are scraped to clean prose and cached for 24h.
+
 It reads text in and writes data out, so it composes:
 
   cat post.md | text readability --lang de
   text entities --file post.md --min-salience 0.02 --output csv
+  text entities --url https://example.com/post
   text readability --file post.md --output toon
-  text lint --file post.md --output table
+  text lint --url https://example.com/post --output table
   text diff draft1.md draft2.md
+  text fetch https://example.com/post --output text
+  text research papers "how is readability measured?"
   jq -c '{id, text}' posts.jsonl | text readability --input-format jsonl --output ndjson`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -170,6 +260,10 @@ It reads text in and writes data out, so it composes:
 			if st.Strip != "" && !strip.Valid(st.Strip) {
 				return errs.Newf(errs.CodeInvalidArgs, "unknown strip mode: %q", st.Strip).
 					WithHint("Use --strip " + strings.Join(strip.Modes(), ", ") + ".")
+			}
+			if st.Fetcher != "" && !fetch.Registered(st.Fetcher) {
+				return errs.Newf(errs.CodeInvalidArgs, "unknown fetcher: %q", st.Fetcher).
+					WithHint("Use --fetcher " + strings.Join(fetch.Names(), ", ") + ".")
 			}
 			dataDir, err := config.DataDir()
 			if err != nil {
@@ -205,6 +299,9 @@ It reads text in and writes data out, so it composes:
 	pf.StringVar(&st.IDField, "id-field", "id", "JSONL field holding the document id")
 	pf.Int64Var(&st.MaxBytes, "max-bytes", input.DefaultMaxBytes, "maximum input size in bytes")
 	pf.StringVar(&st.Strip, "strip", string(strip.ModeAuto), "reduce markup to prose before analysis: auto|markdown|html|none")
+	pf.StringArrayVar(&st.URLs, "url", nil, "fetch a web page and analyse it (repeatable)")
+	pf.StringVar(&st.Fetcher, "fetcher", "", "backend for --url and `text fetch`: "+strings.Join(fetch.Names(), "|"))
+	pf.BoolVar(&st.MainContent, "main-content", true, "drop nav, headers, and footers from a fetched page")
 	pf.BoolVar(&st.NoCache, "no-cache", false, "bypass cache read and write")
 	pf.BoolVar(&st.Refresh, "refresh", false, "bypass cache read, write fresh result")
 	pf.DurationVar(&st.CacheTTL, "cache-ttl", 0, "override cache TTL for this call (e.g. 30m)")
@@ -221,6 +318,8 @@ It reads text in and writes data out, so it composes:
 		newDiffCmd(),
 		newLintCmd(),
 		newKBCmd(),
+		newFetchCmd(),
+		newResearchCmd(),
 		newConfigCmd(),
 		newUpdateCmd(version),
 	)
