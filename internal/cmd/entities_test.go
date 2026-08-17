@@ -27,6 +27,9 @@ type fakeEntityProvider struct {
 	lastText string
 	lastOpts entity.Options
 	err      error
+	// byText overrides the canned answer for one specific input document, so a
+	// batch test can hand each document its own entities without a network.
+	byText map[string][]entity.Entity
 }
 
 func (f *fakeEntityProvider) Name() string { return "fake" }
@@ -39,31 +42,32 @@ func (f *fakeEntityProvider) AnalyzeEntities(_ context.Context, text string, opt
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &entity.Result{
-		Provider:          "fake",
-		Language:          "de",
-		LanguageSupported: true,
-		Entities: []entity.Entity{
-			{
-				Name: "Ada Lovelace", Type: "PERSON", Probability: 0.98, MentionCount: 2,
-				Metadata:     map[string]string{"wikipedia_url": "https://de.wikipedia.org/wiki/Ada_Lovelace", "mid": "/m/0ff4d"},
-				WikipediaURL: "https://de.wikipedia.org/wiki/Ada_Lovelace",
-				MID:          "/m/0ff4d",
-				Mentions: []entity.Mention{
-					{Text: "Ada Lovelace", Type: "PROPER", BeginOffset: 0, Probability: 0.98},
-					{Text: "Lovelace", Type: "PROPER", BeginOffset: 40, Probability: 0.9},
-				},
+	res := &entity.Result{Provider: "fake", Language: "de", LanguageSupported: true}
+	if ents, ok := f.byText[text]; ok {
+		res.Entities = ents
+		return res, nil
+	}
+	res.Entities = []entity.Entity{
+		{
+			Name: "Ada Lovelace", Type: "PERSON", Salience: 0.6, Probability: 0.98, MentionCount: 2,
+			Metadata:     map[string]string{"wikipedia_url": "https://de.wikipedia.org/wiki/Ada_Lovelace", "mid": "/m/0ff4d"},
+			WikipediaURL: "https://de.wikipedia.org/wiki/Ada_Lovelace",
+			MID:          "/m/0ff4d",
+			Mentions: []entity.Mention{
+				{Text: "Ada Lovelace", Type: "PROPER", BeginOffset: 0, Probability: 0.98},
+				{Text: "Lovelace", Type: "PROPER", BeginOffset: 40, Probability: 0.9},
 			},
-			{Name: "London", Type: "LOCATION", Probability: 0.7, MentionCount: 1},
-			{Name: "Rechenmaschine", Type: "OTHER", Probability: 0.3, MentionCount: 1},
 		},
-	}, nil
+		{Name: "London", Type: "LOCATION", Salience: 0.3, Probability: 0.7, MentionCount: 1},
+		{Name: "Rechenmaschine", Type: "OTHER", Salience: 0.1, Probability: 0.3, MentionCount: 1},
+	}
+	return res, nil
 }
 
 func (f *fakeEntityProvider) reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls, f.err = 0, nil
+	f.calls, f.err, f.byText = 0, nil, nil
 }
 
 func (f *fakeEntityProvider) callCount() int {
@@ -167,10 +171,13 @@ func TestEntitiesSingleDocumentJSONShape(t *testing.T) {
 	if !ok || len(ents) != 3 {
 		t.Fatalf("data.entities = %v", data["entities"])
 	}
-	// Sorted by probability desc.
+	// Sorted by salience desc.
 	first := ents[0].(map[string]any)
 	if first["name"] != "Ada Lovelace" || first["type"] != "PERSON" {
 		t.Fatalf("first entity = %v", first)
+	}
+	if first["salience"] != 0.6 {
+		t.Fatalf("salience = %v", first["salience"])
 	}
 	if first["probability"] != 0.98 {
 		t.Fatalf("probability = %v", first["probability"])
@@ -226,13 +233,16 @@ func TestEntitiesTypeFilter(t *testing.T) {
 	}
 }
 
-func TestEntitiesMinProbabilityAndTop(t *testing.T) {
+// TestEntitiesMinSalienceAndTop pins the threshold semantics: it is compared
+// against the entity score, which is salience whenever the provider reports
+// one. The fake's saliences are 0.6 / 0.3 / 0.1.
+func TestEntitiesMinSalienceAndTop(t *testing.T) {
 	fakeEnts.reset()
 	file := writeTemp(t, "doc.txt", "Ada Lovelace arbeitete in London.")
 
-	env, _ := runEntities(t, &State{}, "--file", file, "--provider", "fake", "--min-probability", "0.5")
+	env, _ := runEntities(t, &State{}, "--file", file, "--provider", "fake", "--min-salience", "0.2")
 	if got := len(env["data"].(map[string]any)["entities"].([]any)); got != 2 {
-		t.Fatalf("--min-probability 0.5 kept %d, want 2", got)
+		t.Fatalf("--min-salience 0.2 kept %d, want 2", got)
 	}
 
 	env, _ = runEntities(t, &State{}, "--file", file, "--provider", "fake", "--top", "1")
@@ -241,22 +251,65 @@ func TestEntitiesMinProbabilityAndTop(t *testing.T) {
 		t.Fatalf("--top 1 = %v", ents)
 	}
 
-	env, _ = runEntities(t, &State{}, "--file", file, "--provider", "fake", "--min-probability", "0.99")
+	env, _ = runEntities(t, &State{}, "--file", file, "--provider", "fake", "--min-salience", "0.99")
 	ents, ok := env["data"].(map[string]any)["entities"].([]any)
 	if !ok || len(ents) != 0 {
 		t.Fatalf("entities = %v, want an empty array rather than null", env["data"].(map[string]any)["entities"])
 	}
 }
 
-func TestEntitiesRejectsOutOfRangeProbability(t *testing.T) {
+// TestEntitiesMinProbabilityIsAnAliasForMinSalience documents the compatibility
+// rule: the older flag sets the same threshold, and an explicit --min-salience
+// wins when both are given.
+func TestEntitiesMinProbabilityIsAnAliasForMinSalience(t *testing.T) {
+	fakeEnts.reset()
+	file := writeTemp(t, "doc.txt", "Ada Lovelace arbeitete in London.")
+
+	env, _ := runEntities(t, &State{}, "--file", file, "--provider", "fake", "--min-probability", "0.2")
+	if got := len(env["data"].(map[string]any)["entities"].([]any)); got != 2 {
+		t.Fatalf("--min-probability 0.2 kept %d, want the same 2 as --min-salience", got)
+	}
+
+	env, _ = runEntities(t, &State{}, "--file", file, "--provider", "fake", "--min-probability", "0.2", "--min-salience", "0.5")
+	if got := len(env["data"].(map[string]any)["entities"].([]any)); got != 1 {
+		t.Fatalf("explicit --min-salience did not win: kept %d, want 1", got)
+	}
+}
+
+func TestEntitiesRejectsOutOfRangeThresholds(t *testing.T) {
+	fakeEnts.reset()
+	file := writeTemp(t, "doc.txt", "Ada Lovelace.")
+	for _, flag := range []string{"--min-probability", "--min-salience"} {
+		root, _ := newTestRoot(t, &State{})
+		root.SetArgs([]string{"entities", "--file", file, "--provider", "fake", flag, "2"})
+		err := root.Execute()
+		var e *errs.E
+		if err == nil || !asErr(err, &e) || e.Code != errs.CodeInvalidArgs {
+			t.Fatalf("%s 2: err = %v, want invalid_args", flag, err)
+		}
+	}
+}
+
+func TestEntitiesRejectsUnknownSort(t *testing.T) {
 	fakeEnts.reset()
 	file := writeTemp(t, "doc.txt", "Ada Lovelace.")
 	root, _ := newTestRoot(t, &State{})
-	root.SetArgs([]string{"entities", "--file", file, "--provider", "fake", "--min-probability", "2"})
+	root.SetArgs([]string{"entities", "--file", file, "--provider", "fake", "--sort", "probability"})
 	err := root.Execute()
 	var e *errs.E
 	if err == nil || !asErr(err, &e) || e.Code != errs.CodeInvalidArgs {
 		t.Fatalf("err = %v, want invalid_args", err)
+	}
+}
+
+func TestEntitiesSortFlag(t *testing.T) {
+	fakeEnts.reset()
+	file := writeTemp(t, "doc.txt", "Ada Lovelace arbeitete in London.")
+
+	env, _ := runEntities(t, &State{}, "--file", file, "--provider", "fake", "--sort", "name")
+	ents := env["data"].(map[string]any)["entities"].([]any)
+	if ents[0].(map[string]any)["name"] != "Ada Lovelace" || ents[1].(map[string]any)["name"] != "London" {
+		t.Fatalf("--sort name = %v", ents)
 	}
 }
 
@@ -480,13 +533,13 @@ func TestEntitiesCSVColumns(t *testing.T) {
 	st := &State{OutputFormat: "csv"}
 	_, out := runEntities(t, st, "--file", file, "--provider", "fake")
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if lines[0] != "doc_id,name,type,probability,mentions,wikipedia_url" {
+	if lines[0] != "doc_id,name,type,salience,probability,mentions,wikipedia_url" {
 		t.Fatalf("header = %q", lines[0])
 	}
 	if len(lines) != 4 {
 		t.Fatalf("rows = %d, want a header plus one row per entity:\n%s", len(lines), out)
 	}
-	if !strings.HasPrefix(lines[1], "0,Ada Lovelace,PERSON,0.98,2,https://") {
+	if !strings.HasPrefix(lines[1], "0,Ada Lovelace,PERSON,0.6,0.98,2,https://") {
 		t.Fatalf("row = %q", lines[1])
 	}
 }
@@ -501,8 +554,8 @@ func TestEntitiesTextOutput(t *testing.T) {
 	if len(lines) != 3 {
 		t.Fatalf("text lines = %d, want one per entity:\n%s", len(lines), out)
 	}
-	if !strings.Contains(lines[0], "Ada Lovelace") || !strings.Contains(lines[0], "PERSON") || !strings.Contains(lines[0], "0.98") {
-		t.Fatalf("line = %q", lines[0])
+	if !strings.Contains(lines[0], "Ada Lovelace") || !strings.Contains(lines[0], "PERSON") || !strings.Contains(lines[0], "0.6000") {
+		t.Fatalf("line = %q, want the salience score rendered", lines[0])
 	}
 	if !strings.Contains(lines[0], "2 mentions") || !strings.Contains(lines[1], "1 mention") {
 		t.Fatalf("mention counts not rendered:\n%s", out)
@@ -537,6 +590,206 @@ func TestEntitiesAlias(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "Ada Lovelace") {
 		t.Fatalf("alias produced %q", buf.String())
+	}
+}
+
+// aggregateFixture wires the fake provider to hand three documents their own
+// entities, and returns the JSONL file that produces them.
+func aggregateFixture(t *testing.T) string {
+	t.Helper()
+	fakeEnts.reset()
+	fakeEnts.byText = map[string][]entity.Entity{
+		"one": {
+			{Name: "Ada Lovelace", Type: "PERSON", Salience: 0.5, MentionCount: 3,
+				WikipediaURL: "https://en.wikipedia.org/wiki/Ada_Lovelace", MID: "/m/0ff4d"},
+			{Name: "London", Type: "LOCATION", Salience: 0.3, MentionCount: 1},
+			{Name: "Apple", Type: "ORGANIZATION", Salience: 0.2, MentionCount: 1},
+		},
+		"two": {
+			{Name: "ada lovelace", Type: "PERSON", Salience: 0.2, MentionCount: 1},
+			{Name: "Charles Babbage", Type: "PERSON", Salience: 0.6, MentionCount: 2},
+			{Name: "apple", Type: "CONSUMER_GOOD", Salience: 0.2, MentionCount: 1},
+		},
+		"three": {
+			{Name: "Ada Lovelace", Type: "PERSON", Salience: 0.1, MentionCount: 1},
+		},
+	}
+	return writeTemp(t, "docs.jsonl",
+		`{"id":"a","text":"one"}`+"\n"+
+			`{"id":"b","text":"two"}`+"\n"+
+			`{"id":"c","text":"three"}`+"\n")
+}
+
+func TestEntitiesAggregateJSONShape(t *testing.T) {
+	file := aggregateFixture(t)
+
+	env, _ := runEntities(t, &State{}, "--file", file, "--input-format", "jsonl", "--provider", "fake", "--aggregate")
+	data := env["data"].(map[string]any)
+	if data["documents"] != float64(3) {
+		t.Fatalf("data.documents = %v, want 3", data["documents"])
+	}
+	if _, has := data["entities"]; !has {
+		t.Fatalf("data = %v, want an entities list", data)
+	}
+	ents := data["entities"].([]any)
+	// Ada: 0.5+0.2+0.1 = 0.8 over three documents; Babbage: 0.6 over one.
+	if len(ents) != 5 {
+		t.Fatalf("merged entities = %d, want 5:\n%v", len(ents), ents)
+	}
+	ada := ents[0].(map[string]any)
+	if ada["name"] != "Ada Lovelace" || ada["type"] != "PERSON" {
+		t.Fatalf("first merged entity = %v", ada)
+	}
+	if ada["combined_salience"] != 0.8 {
+		t.Fatalf("combined_salience = %v, want 0.8", ada["combined_salience"])
+	}
+	if ada["avg_salience"] != 0.2667 {
+		t.Fatalf("avg_salience = %v, want 0.2667 (rounded to 4 decimals)", ada["avg_salience"])
+	}
+	if ada["mentions"] != float64(5) || ada["documents"] != float64(3) {
+		t.Fatalf("mentions/documents = %v/%v, want 5/3", ada["mentions"], ada["documents"])
+	}
+	if ada["wikipedia_url"] != "https://en.wikipedia.org/wiki/Ada_Lovelace" {
+		t.Fatalf("wikipedia_url = %v", ada["wikipedia_url"])
+	}
+	// A batch under --aggregate must not also carry the per-document list.
+	if _, has := data["documents"].([]any); has {
+		t.Fatal("data.documents must be a count, not the per-document list")
+	}
+	// Apple the ORGANIZATION and apple the CONSUMER_GOOD stay apart.
+	var apples int
+	for _, e := range ents {
+		if strings.EqualFold(e.(map[string]any)["name"].(string), "apple") {
+			apples++
+		}
+	}
+	if apples != 2 {
+		t.Fatalf("apple entities = %d, want 2 (different types must not merge)", apples)
+	}
+	if env["meta"].(map[string]any)["documents"] != float64(3) {
+		t.Fatalf("meta.documents = %v", env["meta"].(map[string]any)["documents"])
+	}
+}
+
+// TestEntitiesAggregateFilterComposition pins where each filter runs: --types
+// before the merge, --top after it.
+func TestEntitiesAggregateFilterComposition(t *testing.T) {
+	file := aggregateFixture(t)
+
+	env, _ := runEntities(t, &State{}, "--file", file, "--input-format", "jsonl", "--provider", "fake",
+		"--aggregate", "--types", "PERSON")
+	ents := env["data"].(map[string]any)["entities"].([]any)
+	if len(ents) != 2 {
+		t.Fatalf("--types PERSON merged %d entities, want 2", len(ents))
+	}
+	for _, e := range ents {
+		if e.(map[string]any)["type"] != "PERSON" {
+			t.Fatalf("--types leaked %v", e)
+		}
+	}
+
+	// --top applies to the merged list, so the winner is the entity with the
+	// highest combined salience (Ada, 0.8) and not the one with the highest
+	// single-document salience (Babbage, 0.6).
+	env, _ = runEntities(t, &State{}, "--file", file, "--input-format", "jsonl", "--provider", "fake",
+		"--aggregate", "--top", "1")
+	ents = env["data"].(map[string]any)["entities"].([]any)
+	if len(ents) != 1 || ents[0].(map[string]any)["name"] != "Ada Lovelace" {
+		t.Fatalf("--top 1 = %v", ents)
+	}
+
+	// The salience threshold runs per document, before the merge: Ada's 0.2 and
+	// 0.1 contributions drop out and only her 0.5 document survives.
+	env, _ = runEntities(t, &State{}, "--file", file, "--input-format", "jsonl", "--provider", "fake",
+		"--aggregate", "--min-salience", "0.25")
+	ents = env["data"].(map[string]any)["entities"].([]any)
+	found := false
+	for _, e := range ents {
+		m := e.(map[string]any)
+		if m["name"] == "Ada Lovelace" {
+			found = true
+			if m["combined_salience"] != 0.5 || m["documents"] != float64(1) {
+				t.Fatalf("per-document threshold ran after the merge: %v", m)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("Ada was filtered out entirely: %v", ents)
+	}
+
+	// --sort reorders the merged list without changing its contents.
+	env, _ = runEntities(t, &State{}, "--file", file, "--input-format", "jsonl", "--provider", "fake",
+		"--aggregate", "--sort", "name")
+	ents = env["data"].(map[string]any)["entities"].([]any)
+	if ents[0].(map[string]any)["name"] != "Ada Lovelace" || ents[1].(map[string]any)["name"] != "Apple" {
+		t.Fatalf("--sort name = %v", ents)
+	}
+}
+
+func TestEntitiesAggregateSingleDocument(t *testing.T) {
+	fakeEnts.reset()
+	file := writeTemp(t, "doc.txt", "Ada Lovelace arbeitete in London.")
+
+	env, _ := runEntities(t, &State{}, "--file", file, "--provider", "fake", "--aggregate")
+	data := env["data"].(map[string]any)
+	if data["documents"] != float64(1) {
+		t.Fatalf("data.documents = %v", data["documents"])
+	}
+	ents := data["entities"].([]any)
+	if len(ents) != 3 {
+		t.Fatalf("entities = %v", ents)
+	}
+	first := ents[0].(map[string]any)
+	// With one document combined and average are the same number.
+	if first["combined_salience"] != 0.6 || first["avg_salience"] != 0.6 {
+		t.Fatalf("single-document aggregate = %v", first)
+	}
+	if first["mentions"] != float64(2) || first["documents"] != float64(1) {
+		t.Fatalf("mentions/documents = %v/%v", first["mentions"], first["documents"])
+	}
+}
+
+func TestEntitiesAggregateOutputFormats(t *testing.T) {
+	file := aggregateFixture(t)
+
+	_, csvOut := runEntities(t, &State{OutputFormat: "csv"}, "--file", file, "--input-format", "jsonl",
+		"--provider", "fake", "--aggregate")
+	lines := strings.Split(strings.TrimSpace(csvOut), "\n")
+	if lines[0] != "name,type,combined_salience,avg_salience,mentions,documents,wikipedia_url" {
+		t.Fatalf("csv header = %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "Ada Lovelace,PERSON,0.8,0.2667,5,3,https://") {
+		t.Fatalf("csv row = %q", lines[1])
+	}
+
+	file = aggregateFixture(t)
+	_, ndOut := runEntities(t, &State{OutputFormat: "ndjson"}, "--file", file, "--input-format", "jsonl",
+		"--provider", "fake", "--aggregate")
+	ndLines := strings.Split(strings.TrimSpace(ndOut), "\n")
+	if len(ndLines) != 5 {
+		t.Fatalf("ndjson lines = %d, want one per merged entity:\n%s", len(ndLines), ndOut)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(ndLines[0]), &rec); err != nil {
+		t.Fatalf("decode %q: %v", ndLines[0], err)
+	}
+	if rec["name"] != "Ada Lovelace" || rec["combined_salience"] != 0.8 || rec["documents"] != float64(3) {
+		t.Fatalf("ndjson record = %v", rec)
+	}
+	if _, has := rec["doc_id"]; has {
+		t.Fatalf("a merged entity must not claim a single doc_id: %v", rec)
+	}
+
+	file = aggregateFixture(t)
+	_, textOut := runEntities(t, &State{OutputFormat: "text"}, "--file", file, "--input-format", "jsonl",
+		"--provider", "fake", "--aggregate")
+	textLines := strings.Split(strings.TrimSpace(textOut), "\n")
+	if len(textLines) != 5 {
+		t.Fatalf("text lines = %d:\n%s", len(textLines), textOut)
+	}
+	if !strings.Contains(textLines[0], "Ada Lovelace") || !strings.Contains(textLines[0], "0.8000") ||
+		!strings.Contains(textLines[0], "avg 0.2667") || !strings.Contains(textLines[0], "3 documents") {
+		t.Fatalf("text line = %q", textLines[0])
 	}
 }
 

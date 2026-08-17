@@ -11,10 +11,12 @@ import (
 
 	"github.com/KLIXPERT-io/text-cli/internal/analyze"
 
-	// Metrics register themselves at init time. Importing the package for that
-	// side effect here is the whole wiring: a future metric package is one more
-	// blank import, not a new command or a switch statement.
-	_ "github.com/KLIXPERT-io/text-cli/internal/analyze/readability"
+	// Metrics register themselves at init time. Importing the package is the
+	// whole wiring: a future metric package is one more import, not a new
+	// command or a switch statement. It is imported by name rather than blank
+	// only for readability.DirectionOf, which the --fail-under/--fail-over gate
+	// needs to know which way a score runs.
+	"github.com/KLIXPERT-io/text-cli/internal/analyze/readability"
 
 	"github.com/KLIXPERT-io/text-cli/internal/errs"
 	"github.com/KLIXPERT-io/text-cli/internal/output"
@@ -37,34 +39,46 @@ func newReadabilityCmd() *cobra.Command {
 	var (
 		metricsFlag string
 		withStats   bool
+		failUnder   float64
+		failOver    float64
 	)
 	c := &cobra.Command{
 		Use:     "readability [text...]",
 		Aliases: []string{"read", "rd", "flesch", "amstad"},
-		Short:   "Score text for reading ease (Flesch, Amstad)",
-		Long: `readability scores prose with the formula calibrated for its language:
-Flesch Reading Ease for English, Amstad for German.
+		Short:   "Score text for reading ease and grade level",
+		Long: `readability scores prose with the formulas calibrated for its language:
+Flesch Reading Ease and the English grade-level pack (Flesch-Kincaid, Gunning
+Fog, SMOG, Coleman-Liau, ARI) for English, Amstad and the four Wiener
+Sachtextformeln for German, and LIX for any language.
 
 With --metrics auto (the default) the language is resolved per document, so a
 mixed-language JSONL batch is scored correctly row by row.
+
+Reading-ease scores run 0–100 with higher meaning easier; grade-level scores are
+school grades, so LOWER means EASIER. --fail-under gates the first family and
+--fail-over the second; each refuses the metrics it cannot mean anything for.
 
 Examples:
   cat post.md | text readability
   text readability --file post.de.md --lang de --output text
   text readability "Short words help." --metrics flesch
+  text readability --file post.md --metrics flesch --fail-under 60   # CI gate
+  text readability --file post.de.md --metrics wstf --fail-over 10   # CI gate
   jq -c '{id, text}' posts.jsonl | text readability --input-format jsonl --output ndjson
 
 Invoked as ` + "`text flesch`" + ` or ` + "`text amstad`" + ` it defaults to that one metric.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runReadability(cmd, args, metricsFlag, withStats)
+			return runReadability(cmd, args, metricsFlag, withStats, readGates(cmd, failUnder, failOver))
 		},
 	}
 	c.Flags().StringVar(&metricsFlag, "metrics", "", `metrics to compute: comma-separated names, "auto", or "all" (default: config defaults.metrics, else auto)`)
 	c.Flags().BoolVar(&withStats, "stats", true, "include token statistics (words, sentences, syllables, averages)")
+	c.Flags().Float64Var(&failUnder, "fail-under", 0, "exit non-zero if a reading-ease score (higher is easier: flesch, amstad) is below this threshold")
+	c.Flags().Float64Var(&failOver, "fail-over", 0, "exit non-zero if a grade-level score (lower is easier: wstf*, lix, flesch-kincaid, gunning-fog, smog, coleman-liau, ari) is above this threshold")
 	return c
 }
 
-func runReadability(cmd *cobra.Command, args []string, metricsFlag string, withStats bool) error {
+func runReadability(cmd *cobra.Command, args []string, metricsFlag string, withStats bool, gates []gate) error {
 	s := getState(cmd)
 
 	items, err := s.LoadInput(args)
@@ -73,6 +87,11 @@ func runReadability(cmd *cobra.Command, args []string, metricsFlag string, withS
 	}
 	sel := metricsSelection(cmd, s, metricsFlag)
 	lang := s.Language()
+	// An explicit --metrics list is the user's own choice of metric, so a
+	// threshold pointed the wrong way at one of them is an argument error. Under
+	// auto/all the selection is the registry's choice, so a gate simply applies
+	// to the metrics it fits and ignores the rest.
+	explicitMetrics := !isAutoSelection(sel)
 
 	docs := make([]readabilityDoc, 0, len(items))
 	rows := make([]output.Row, 0, len(items))
@@ -92,6 +111,11 @@ func runReadability(cmd *cobra.Command, args []string, metricsFlag string, withS
 		if err != nil {
 			return rdDocumentErr(err, it.ID, len(items))
 		}
+		if explicitMetrics {
+			if err := checkGateDirections(gates, selected); err != nil {
+				return err
+			}
+		}
 
 		results := make([]analyze.Result, 0, len(selected))
 		row := output.Row{"id": it.ID, "language": string(d.Language)}
@@ -108,6 +132,7 @@ func runReadability(cmd *cobra.Command, args []string, metricsFlag string, withS
 				return rdDocumentErr(err, it.ID, len(items))
 			}
 			results = append(results, r)
+			applyGates(gates, it.ID, r)
 			row[r.Metric] = r.Score
 			row[r.Metric+"_level"] = r.Level
 			if !seenMetric[r.Metric] {
@@ -140,14 +165,221 @@ func runReadability(cmd *cobra.Command, args []string, metricsFlag string, withS
 		data = docs[0]
 	}
 
-	return emitResult(cmd, emitOpts{
+	// The output goes out first even when a gate has failed: a CI job that gates
+	// a docs build still needs the numbers that failed it on stdout. The gate
+	// verdict travels as the returned error, which the root command renders as
+	// one JSON line on stderr and turns into the exit code.
+	if err := emitResult(cmd, emitOpts{
 		Data:    data,
 		Meta:    readabilityMeta(docs, truncated),
 		Columns: columns,
 		Rows:    rows,
 		Records: records,
 		Text:    func(w io.Writer) error { return writeReadabilityText(w, docs) },
-	})
+	}); err != nil {
+		return err
+	}
+	return gateVerdict(gates, len(docs))
+}
+
+// ---------------------------------------------------------------------------
+// --fail-under / --fail-over
+//
+// Readability numbers run in two directions. Flesch and Amstad are reading-ease
+// scores: 0–100, higher is easier, and "must score at least 60" is the sensible
+// gate. Every grade-level formula — the Wiener Sachtextformeln, LIX,
+// Flesch-Kincaid, Gunning Fog, SMOG, Coleman-Liau, ARI — is a school grade:
+// lower is easier, and the sensible gate is "must score at most 10". A single
+// --fail-under applied to both families would silently invert its own verdict on
+// half of them, passing exactly the documents it should have failed.
+//
+// So there are two flags, and each one knows which metrics it can mean anything
+// for. The direction comes from readability.DirectionOf: analyze.Metric has no
+// Direction field and internal/analyze/registry.go is not this change's to
+// widen, so the readability package publishes an exported lookup keyed by metric
+// name instead. Inferring the direction from the Scale string was the
+// alternative and was rejected: those strings are prose, written in German for
+// the German metrics, and a CI gate must not hinge on their wording.
+// ---------------------------------------------------------------------------
+
+// gate is one resolved threshold flag.
+type gate struct {
+	flag      string                // "fail-under" or "fail-over"
+	threshold float64               // the value scores are compared against
+	dir       readability.Direction // the direction of the metrics this gate applies to
+	// applied counts the metric results this gate actually judged, so a gate
+	// that matched nothing can be reported as a mistake instead of passing
+	// vacuously.
+	applied  int
+	failures []gateFailure
+}
+
+// gateFailure is one metric on one document falling the wrong side of a gate.
+type gateFailure struct {
+	doc    string
+	metric string
+	score  float64
+}
+
+// readGates turns the two flags into gates. Both may be given at once: on a
+// mixed selection that gates the reading-ease scores and the grade levels in
+// one run, each in its own direction.
+func readGates(cmd *cobra.Command, failUnder, failOver float64) []gate {
+	var gates []gate
+	if cmd.Flags().Changed("fail-under") {
+		gates = append(gates, gate{flag: "fail-under", threshold: failUnder, dir: readability.HigherIsEasier})
+	}
+	if cmd.Flags().Changed("fail-over") {
+		gates = append(gates, gate{flag: "fail-over", threshold: failOver, dir: readability.LowerIsEasier})
+	}
+	return gates
+}
+
+// metricDirection reports which way a metric's score runs. A metric registered
+// by some future package without declaring a direction is left ungated rather
+// than guessed at: a threshold that might be inverted is worse than no
+// threshold, because CI would be green for the wrong reason.
+func metricDirection(name string) (readability.Direction, bool) {
+	return readability.DirectionOf(name)
+}
+
+// checkGateDirections rejects a threshold that cannot mean anything for any
+// metric the caller asked for, naming those metrics and the flag that would have
+// worked. This is what stops `--metrics wstf --fail-under 8` from quietly
+// passing every document: on a grade-level metric "not under 8" is satisfied by
+// every text that is not a children's book, so the run would look green for
+// exactly the wrong reason.
+//
+// A metric of the other direction inside a mixed selection is not an error — it
+// is simply left ungated, and `--metrics flesch,ari --fail-under 60 --fail-over
+// 12` gates both families in one run. What is refused is a gate that judges
+// nothing, because that is the case where CI is green without measuring.
+func checkGateDirections(gates []gate, selected []analyze.Metric) error {
+	for _, g := range gates {
+		var mismatched []string
+		matched := false
+		for _, m := range selected {
+			dir, known := metricDirection(m.Name)
+			switch {
+			case !known:
+				// Undeclared direction: never gated, never complained about.
+			case dir == g.dir:
+				matched = true
+			default:
+				mismatched = append(mismatched, m.Name)
+			}
+		}
+		if matched {
+			continue
+		}
+		if len(mismatched) == 0 {
+			// Only reachable with a metric that declares no direction at all.
+			return errs.Newf(errs.CodeInvalidArgs,
+				"--%s applies to metrics where %s, and --metrics selected none that declares a direction", g.flag, directionPhrase(g.dir)).
+				WithHint(fmt.Sprintf("Select a readability metric, or drop --%s.", g.flag))
+		}
+		return errs.Newf(errs.CodeInvalidArgs,
+			"--%s applies to metrics where %s, but --metrics selected only %s, where %s",
+			g.flag, directionPhrase(g.dir), strings.Join(quoteAll(mismatched), ", "), directionPhrase(flipDirection(g.dir))).
+			WithHint(fmt.Sprintf("Gate those with --%s instead, or select a metric where %s.",
+				oppositeFlag(g.flag), directionPhrase(g.dir)))
+	}
+	return nil
+}
+
+func flipDirection(d readability.Direction) readability.Direction {
+	if d == readability.LowerIsEasier {
+		return readability.HigherIsEasier
+	}
+	return readability.LowerIsEasier
+}
+
+func quoteAll(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, strconv.Quote(n))
+	}
+	return out
+}
+
+// applyGates judges one metric result against every gate that fits its
+// direction.
+func applyGates(gates []gate, docID string, r analyze.Result) {
+	for i := range gates {
+		g := &gates[i]
+		dir, known := metricDirection(r.Metric)
+		if !known || dir != g.dir {
+			continue
+		}
+		g.applied++
+		failed := r.Score < g.threshold // --fail-under: higher is easier
+		if g.dir == readability.LowerIsEasier {
+			failed = r.Score > g.threshold // --fail-over: lower is easier
+		}
+		if failed {
+			g.failures = append(g.failures, gateFailure{doc: docID, metric: r.Metric, score: r.Score})
+		}
+	}
+}
+
+// gateVerdict is the run's exit verdict. In a batch any failing document fails
+// the run, and the message says how many did, because that count is what a CI
+// log is read for.
+func gateVerdict(gates []gate, docs int) error {
+	var (
+		details []string
+		failed  = map[string]bool{}
+	)
+	for _, g := range gates {
+		if g.applied == 0 {
+			// Only reachable under --metrics auto/all: an explicit selection is
+			// rejected up front by checkGateDirections. A gate that judged
+			// nothing must not report success.
+			return errs.Newf(errs.CodeInvalidArgs,
+				"--%s applies to metrics where %s, and none was computed", g.flag, directionPhrase(g.dir)).
+				WithHint(fmt.Sprintf("Name one with --metrics, or use --%s.", oppositeFlag(g.flag)))
+		}
+		for _, f := range g.failures {
+			failed[f.doc] = true
+			details = append(details, fmt.Sprintf("%s=%s (--%s %s)",
+				f.metric, rdNum(f.score), g.flag, rdNum(g.threshold)))
+		}
+	}
+	if len(details) == 0 {
+		return nil
+	}
+	sort.Strings(details)
+	msg := fmt.Sprintf("readability gate failed: %d of %d documents missed the threshold: %s",
+		len(failed), docs, strings.Join(details, ", "))
+	if docs == 1 {
+		msg = "readability gate failed: " + strings.Join(details, ", ")
+	}
+	return errs.New(errs.CodeGeneric, msg).
+		WithHint("The scores were printed to stdout. Simplify the text, or relax the threshold.")
+}
+
+// directionPhrase describes a direction in the words a hint needs.
+func directionPhrase(d readability.Direction) string {
+	if d == readability.LowerIsEasier {
+		return "a lower score is easier"
+	}
+	return "a higher score is easier"
+}
+
+func oppositeFlag(flag string) string {
+	if flag == "fail-under" {
+		return "fail-over"
+	}
+	return "fail-under"
+}
+
+// isAutoSelection reports whether --metrics left the choice to the registry.
+func isAutoSelection(sel string) bool {
+	switch strings.ToLower(strings.TrimSpace(sel)) {
+	case "", "auto", "all":
+		return true
+	}
+	return false
 }
 
 // metricsSelection resolves what to compute: the flag if given, then the
@@ -172,8 +404,7 @@ func metricsSelection(cmd *cobra.Command, s *State, flag string) string {
 // resolveMetrics turns a --metrics selection into the metrics to run for one
 // document's language.
 func resolveMetrics(sel string, lang textproc.Language) ([]analyze.Metric, error) {
-	switch strings.ToLower(strings.TrimSpace(sel)) {
-	case "", "auto", "all":
+	if isAutoSelection(sel) {
 		// "auto" and "all" agree today because every metric declares its
 		// languages; both mean "everything valid for this document".
 		ms := analyze.ForLanguage(lang)

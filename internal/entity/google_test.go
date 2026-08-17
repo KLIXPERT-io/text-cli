@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"cloud.google.com/go/language/apiv2/languagepb"
+	"cloud.google.com/go/language/apiv1/languagepb"
 	"github.com/KLIXPERT-io/text-cli/internal/errs"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -170,37 +170,39 @@ func TestTranslateContextDeadline(t *testing.T) {
 	}
 }
 
+// TestConvertResponse pins the v1 mapping: salience is carried through,
+// language comes from the v1 `language` field, and language_supported is true
+// because v1 has no such flag and refuses unsupported languages outright.
 func TestConvertResponse(t *testing.T) {
 	resp := &languagepb.AnalyzeEntitiesResponse{
-		LanguageCode:      "de",
-		LanguageSupported: true,
+		Language: "de",
 		Entities: []*languagepb.Entity{
 			{
-				Name: "Ada Lovelace",
-				Type: languagepb.Entity_PERSON,
+				Name:     "Ada Lovelace",
+				Type:     languagepb.Entity_PERSON,
+				Salience: 0.6421,
 				Metadata: map[string]string{
 					"wikipedia_url": "https://de.wikipedia.org/wiki/Ada_Lovelace",
 					"mid":           "/m/0ff4d",
 				},
 				Mentions: []*languagepb.EntityMention{
 					{
-						Text:        &languagepb.TextSpan{Content: "Ada Lovelace", BeginOffset: 0},
-						Type:        languagepb.EntityMention_PROPER,
-						Probability: 0.72,
+						Text: &languagepb.TextSpan{Content: "Ada Lovelace", BeginOffset: 0},
+						Type: languagepb.EntityMention_PROPER,
 					},
 					{
-						Text:        &languagepb.TextSpan{Content: "Lovelace", BeginOffset: 42},
-						Type:        languagepb.EntityMention_PROPER,
-						Probability: 0.98,
+						Text: &languagepb.TextSpan{Content: "Lovelace", BeginOffset: 42},
+						Type: languagepb.EntityMention_PROPER,
 					},
 				},
 				Sentiment: &languagepb.Sentiment{Score: 0.5, Magnitude: 1.5},
 			},
 			{
-				Name: "Rechenmaschine",
-				Type: languagepb.Entity_OTHER,
+				Name:     "Rechenmaschine",
+				Type:     languagepb.Entity_OTHER,
+				Salience: 0.1,
 				Mentions: []*languagepb.EntityMention{
-					{Text: &languagepb.TextSpan{Content: "Rechenmaschine", BeginOffset: 10}, Type: languagepb.EntityMention_COMMON, Probability: 0.3},
+					{Text: &languagepb.TextSpan{Content: "Rechenmaschine", BeginOffset: 10}, Type: languagepb.EntityMention_COMMON},
 				},
 			},
 		},
@@ -221,9 +223,21 @@ func TestConvertResponse(t *testing.T) {
 	if ada.Name != "Ada Lovelace" || ada.Type != "PERSON" {
 		t.Fatalf("entity = %+v", ada)
 	}
-	// Probability is the maximum mention probability, not the first or the last.
-	if diff := ada.Probability - 0.98; diff > 1e-6 || diff < -1e-6 {
-		t.Fatalf("probability = %v, want the max mention probability 0.98", ada.Probability)
+	// Salience survives the float32 -> float64 widening as an exact 4-decimal
+	// number rather than 0.6420999765396118.
+	if ada.Salience != 0.6421 {
+		t.Fatalf("salience = %v, want 0.6421", ada.Salience)
+	}
+	if ada.Score() != 0.6421 {
+		t.Fatalf("score = %v, want the salience", ada.Score())
+	}
+	// v1 has no per-mention probability; inventing one from salience would
+	// confuse importance with confidence.
+	if ada.Probability != 0 {
+		t.Fatalf("probability = %v, want 0: v1 reports none", ada.Probability)
+	}
+	if ada.Mentions[0].Probability != 0 {
+		t.Fatalf("mention probability = %v, want 0", ada.Mentions[0].Probability)
 	}
 	if ada.MentionCount != 2 || len(ada.Mentions) != 2 {
 		t.Fatalf("mention_count = %d, mentions = %d", ada.MentionCount, len(ada.Mentions))
@@ -248,6 +262,9 @@ func TestConvertResponse(t *testing.T) {
 	if other.Type != "OTHER" || other.MentionCount != 1 || other.Mentions[0].Type != "COMMON" {
 		t.Fatalf("entity = %+v", other)
 	}
+	if other.Salience != 0.1 {
+		t.Fatalf("salience = %v, want 0.1", other.Salience)
+	}
 	if other.Sentiment != nil {
 		t.Fatalf("sentiment = %+v, want nil when the provider returned none", other.Sentiment)
 	}
@@ -261,6 +278,9 @@ func TestConvertResponseIsNilSafe(t *testing.T) {
 	if got == nil || got.Entities == nil || len(got.Entities) != 0 {
 		t.Fatalf("convertResponse(nil) = %+v, want an empty result", got)
 	}
+	if !got.LanguageSupported {
+		t.Fatal("language_supported must default to true for a backend without the signal")
+	}
 	got = convertResponse(&languagepb.AnalyzeEntitiesResponse{
 		Entities: []*languagepb.Entity{
 			nil,
@@ -271,7 +291,7 @@ func TestConvertResponseIsNilSafe(t *testing.T) {
 		t.Fatalf("nil entity was not skipped: %+v", got.Entities)
 	}
 	e := got.Entities[0]
-	if e.Type != "UNKNOWN" || e.MentionCount != 1 || e.Probability != 0 {
+	if e.Type != "UNKNOWN" || e.MentionCount != 1 || e.Probability != 0 || e.Salience != 0 {
 		t.Fatalf("bare entity = %+v", e)
 	}
 	if e.Mentions[0].Text != "" || e.Mentions[0].BeginOffset != 0 {

@@ -175,7 +175,12 @@ func TestForLanguage(t *testing.T) {
 			t.Fatalf("ForLanguage(%s) did not include %s", lang, want)
 		}
 	}
-	if got := analyze.ForLanguage(textproc.Language("fr")); len(got) != 0 {
-		t.Fatalf("ForLanguage(fr) = %v, want none", got)
+	// A language no formula was calibrated for still gets the language-agnostic
+	// ones — today that is LIX, which counts characters and never syllables.
+	// The syllable-based formulas must stay out of it.
+	for _, m := range analyze.ForLanguage(textproc.Language("fr")) {
+		if !m.Supports(textproc.Language(analyze.AnyLanguage)) {
+			t.Fatalf("ForLanguage(fr) returned %s, which is calibrated for %v", m.Name, m.Languages)
+		}
 	}
 }

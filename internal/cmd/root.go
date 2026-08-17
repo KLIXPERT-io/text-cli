@@ -21,6 +21,7 @@ import (
 	"github.com/KLIXPERT-io/text-cli/internal/input"
 	"github.com/KLIXPERT-io/text-cli/internal/logging"
 	"github.com/KLIXPERT-io/text-cli/internal/output"
+	"github.com/KLIXPERT-io/text-cli/internal/strip"
 	"github.com/KLIXPERT-io/text-cli/internal/textproc"
 	"github.com/KLIXPERT-io/text-cli/internal/update"
 	"github.com/spf13/cobra"
@@ -46,6 +47,7 @@ type State struct {
 	TextField   string
 	IDField     string
 	MaxBytes    int64
+	Strip       string
 
 	Verbose   bool
 	Quiet     bool
@@ -63,9 +65,16 @@ func getState(cmd *cobra.Command) *State {
 	return s
 }
 
-// LoadInput resolves the documents to analyse from flags, args, and stdin.
+// LoadInput resolves the documents to analyse from flags, args, and stdin, and
+// reduces markup to prose before anything measures it.
+//
+// Stripping happens here, once, rather than in each command: scoring a fenced
+// code block or a URL as if it were a sentence is simply wrong, and a command
+// that forgot to strip would report a confidently incorrect number. Defaulting
+// to auto-detection means `cat post.md | text readability` is right without a
+// flag; --strip none opts out.
 func (s *State) LoadInput(args []string) ([]input.Item, error) {
-	return input.Load(input.Options{
+	items, err := input.Load(input.Options{
 		Args:      args,
 		File:      s.File,
 		Format:    input.Format(s.InputFormat),
@@ -73,6 +82,22 @@ func (s *State) LoadInput(args []string) ([]input.Item, error) {
 		IDField:   s.IDField,
 		MaxBytes:  s.MaxBytes,
 	})
+	if err != nil {
+		return nil, err
+	}
+	mode := strip.Mode(firstNonEmpty(s.Strip, string(strip.ModeAuto)))
+	if mode == strip.ModeNone {
+		return items, nil
+	}
+	for i := range items {
+		stripped := strip.Apply(items[i].Text, mode)
+		// Markup that reduces to nothing measurable is left alone: an
+		// over-eager strip must never turn a real document into empty input.
+		if strings.TrimSpace(stripped) != "" {
+			items[i].Text = stripped
+		}
+	}
+	return items, nil
 }
 
 // Language returns the requested analysis language, honoring --lang then
@@ -107,12 +132,24 @@ func Execute(version string) int {
 		Use:   "text",
 		Short: "Text analysis CLI — readability, entities, LLM-friendly output",
 		Long: `text analyses prose from stdin, a file, or an argument and prints
-structured JSON (default), NDJSON, CSV, or a table.
+structured JSON (default), TOON, NDJSON, CSV, or a table.
+
+--output toon emits the same {data, meta} envelope as JSON in TOON
+(Token-Oriented Object Notation), a compact encoding that costs 16-40% fewer
+tokens on this CLI's own payloads — most on uniform arrays, least when one
+long string dominates. Use it when the output is going into an LLM prompt
+rather than into jq, which cannot parse it.
+
+Markdown and HTML are reduced to prose before anything is measured, so a
+fenced code block or a URL never counts as a sentence. --strip none opts out.
 
 It reads text in and writes data out, so it composes:
 
   cat post.md | text readability --lang de
-  text entities --file post.md --min-probability 0.8 --output csv
+  text entities --file post.md --min-salience 0.02 --output csv
+  text readability --file post.md --output toon
+  text lint --file post.md --output table
+  text diff draft1.md draft2.md
   jq -c '{id, text}' posts.jsonl | text readability --input-format jsonl --output ndjson`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -128,7 +165,11 @@ It reads text in and writes data out, so it composes:
 			}
 			if st.OutputFormat != "" && !output.Valid(st.OutputFormat) {
 				return errs.Newf(errs.CodeInvalidArgs, "unknown output format: %q", st.OutputFormat).
-					WithHint("Use --output json, ndjson, csv, table, or text.")
+					WithHint("Use --output json, toon, ndjson, csv, table, or text.")
+			}
+			if st.Strip != "" && !strip.Valid(st.Strip) {
+				return errs.Newf(errs.CodeInvalidArgs, "unknown strip mode: %q", st.Strip).
+					WithHint("Use --strip " + strings.Join(strip.Modes(), ", ") + ".")
 			}
 			dataDir, err := config.DataDir()
 			if err != nil {
@@ -156,13 +197,14 @@ It reads text in and writes data out, so it composes:
 
 	root.Version = version
 	pf := root.PersistentFlags()
-	pf.StringVar(&st.OutputFormat, "output", "", "output format: json|ndjson|csv|table|text (default: json, or table on TTY)")
+	pf.StringVar(&st.OutputFormat, "output", "", "output format: json|toon|ndjson|csv|table|text (default: json, or table on TTY)")
 	pf.StringVar(&st.Lang, "lang", "", "analysis language: auto|en|de (default: auto)")
 	pf.StringVarP(&st.File, "file", "f", "", `read text from a file ("-" for stdin)`)
 	pf.StringVar(&st.InputFormat, "input-format", "text", "input format: text|lines|jsonl")
 	pf.StringVar(&st.TextField, "text-field", "text", "JSONL field holding the text")
 	pf.StringVar(&st.IDField, "id-field", "id", "JSONL field holding the document id")
 	pf.Int64Var(&st.MaxBytes, "max-bytes", input.DefaultMaxBytes, "maximum input size in bytes")
+	pf.StringVar(&st.Strip, "strip", string(strip.ModeAuto), "reduce markup to prose before analysis: auto|markdown|html|none")
 	pf.BoolVar(&st.NoCache, "no-cache", false, "bypass cache read and write")
 	pf.BoolVar(&st.Refresh, "refresh", false, "bypass cache read, write fresh result")
 	pf.DurationVar(&st.CacheTTL, "cache-ttl", 0, "override cache TTL for this call (e.g. 30m)")
@@ -174,6 +216,11 @@ It reads text in and writes data out, so it composes:
 		newReadabilityCmd(),
 		newMetricsCmd(),
 		newEntitiesCmd(),
+		newSentimentCmd(),
+		newClassifyCmd(),
+		newDiffCmd(),
+		newLintCmd(),
+		newKBCmd(),
 		newConfigCmd(),
 		newUpdateCmd(version),
 	)
@@ -242,6 +289,8 @@ func emitResult(cmd *cobra.Command, o emitOpts) error {
 	f := output.ResolveFormat(s.OutputFormat, os.Stdout.Fd())
 
 	switch f {
+	case output.FormatTOON:
+		return output.WriteTOON(w, o.Data, o.Meta)
 	case output.FormatNDJSON:
 		records := o.Records
 		if records == nil {

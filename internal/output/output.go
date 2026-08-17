@@ -1,8 +1,10 @@
-// Package output handles JSON / NDJSON / CSV / table rendering.
+// Package output handles JSON / TOON / NDJSON / CSV / table rendering.
 //
 // JSON is the default when stdout is not a terminal, so `text flesch < a.md |
 // jq` works with no flags. NDJSON exists for the batch case: one result object
-// per line, flushed as it is produced, so a long pipeline streams.
+// per line, flushed as it is produced, so a long pipeline streams. TOON encodes
+// the same envelope as JSON in a far cheaper form for feeding to an LLM; see
+// toon.go.
 package output
 
 import (
@@ -21,6 +23,7 @@ type Format string
 
 const (
 	FormatJSON   Format = "json"
+	FormatTOON   Format = "toon"
 	FormatNDJSON Format = "ndjson"
 	FormatCSV    Format = "csv"
 	FormatTable  Format = "table"
@@ -30,7 +33,7 @@ const (
 // Valid reports whether s names a supported format.
 func Valid(s string) bool {
 	switch Format(s) {
-	case FormatJSON, FormatNDJSON, FormatCSV, FormatTable, FormatText:
+	case FormatJSON, FormatTOON, FormatNDJSON, FormatCSV, FormatTable, FormatText:
 		return true
 	}
 	return false

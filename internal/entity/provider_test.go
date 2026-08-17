@@ -141,7 +141,9 @@ func eqStrings(a, b []string) bool {
 	return true
 }
 
-func TestSortIsProbabilityThenMentionsThenName(t *testing.T) {
+// TestSortFallsBackToProbability covers a provider that reports confidence but
+// no salience: the score is the probability, and the tiebreaks are unchanged.
+func TestSortFallsBackToProbability(t *testing.T) {
 	ents := sample()
 	Sort(ents)
 	want := []string{
@@ -153,6 +155,47 @@ func TestSortIsProbabilityThenMentionsThenName(t *testing.T) {
 	}
 	if got := names(ents); !eqStrings(got, want) {
 		t.Fatalf("Sort = %v, want %v", got, want)
+	}
+}
+
+// TestSortPrefersSalience is the Google v1 case: salience decides, even when a
+// probability is also present.
+func TestSortPrefersSalience(t *testing.T) {
+	ents := []Entity{
+		{Name: "Sidekick", Type: "PERSON", Salience: 0.10, Probability: 0.99, MentionCount: 5},
+		{Name: "Protagonist", Type: "PERSON", Salience: 0.60, Probability: 0.42, MentionCount: 1},
+		{Name: "Extra", Type: "PERSON", MentionCount: 1},
+	}
+	Sort(ents)
+	if got := names(ents); !eqStrings(got, []string{"Protagonist", "Sidekick", "Extra"}) {
+		t.Fatalf("Sort = %v, want salience to decide", got)
+	}
+}
+
+func TestSortByMentionsAndName(t *testing.T) {
+	ents := sample()
+	SortEntities(ents, SortMentions)
+	if got := names(ents)[0]; got != "Analytical Engine" {
+		t.Fatalf("--sort mentions put %q first, want the 3-mention entity", got)
+	}
+	SortEntities(ents, SortName)
+	want := []string{"1843", "Ada Lovelace", "Amber", "Analytical Engine", "Zurich"}
+	if got := names(ents); !eqStrings(got, want) {
+		t.Fatalf("--sort name = %v, want %v", got, want)
+	}
+}
+
+func TestParseSortBy(t *testing.T) {
+	for in, want := range map[string]SortBy{"": SortSalience, " SALIENCE ": SortSalience, "mentions": SortMentions, "name": SortName} {
+		got, err := ParseSortBy(in)
+		if err != nil || got != want {
+			t.Fatalf("ParseSortBy(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	_, err := ParseSortBy("probability")
+	var e *errs.E
+	if !errors.As(err, &e) || e.Code != errs.CodeInvalidArgs {
+		t.Fatalf("ParseSortBy(probability) = %v, want invalid_args", err)
 	}
 }
 
@@ -178,13 +221,22 @@ func TestParseTypes(t *testing.T) {
 	}
 }
 
-func TestFilterMinProbability(t *testing.T) {
-	got := FilterMinProbability(sample(), 0.5)
+func TestFilterMinScore(t *testing.T) {
+	got := FilterMinScore(sample(), 0.5)
 	if len(got) != 4 {
 		t.Fatalf("min 0.5 kept %v", names(got))
 	}
-	if got := FilterMinProbability(sample(), 0); len(got) != 5 {
+	if got := FilterMinScore(sample(), 0); len(got) != 5 {
 		t.Fatalf("min 0 must be a no-op, kept %v", names(got))
+	}
+	// Salience is what a Google v1 entity carries, and it is what the threshold
+	// must compare against there.
+	salient := []Entity{
+		{Name: "Central", Salience: 0.42},
+		{Name: "Aside", Salience: 0.004},
+	}
+	if got := FilterMinScore(salient, 0.01); len(got) != 1 || got[0].Name != "Central" {
+		t.Fatalf("FilterMinScore on salience = %v", names(got))
 	}
 }
 
@@ -204,7 +256,7 @@ func TestTop(t *testing.T) {
 
 func TestResultApply(t *testing.T) {
 	r := &Result{Provider: "fake", Language: "en", LanguageSupported: true, Entities: sample()}
-	got := r.Apply(FilterOptions{Types: []string{"PERSON", "WORK_OF_ART", "DATE"}, MinProbability: 0.2, Top: 1})
+	got := r.Apply(FilterOptions{Types: []string{"PERSON", "WORK_OF_ART", "DATE"}, MinScore: 0.2, Top: 1})
 	if len(got.Entities) != 1 || got.Entities[0].Name != "Ada Lovelace" {
 		t.Fatalf("Apply = %v", names(got.Entities))
 	}
@@ -220,7 +272,7 @@ func TestResultApply(t *testing.T) {
 
 func TestResultApplyEmptyStaysNonNil(t *testing.T) {
 	r := &Result{Provider: "fake", Entities: sample()}
-	got := r.Apply(FilterOptions{MinProbability: 1.5})
+	got := r.Apply(FilterOptions{MinScore: 1.5})
 	if got.Entities == nil {
 		t.Fatal("Apply returned nil entities; JSON must render [] not null")
 	}

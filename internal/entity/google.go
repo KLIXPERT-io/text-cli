@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	language "cloud.google.com/go/language/apiv2"
-	"cloud.google.com/go/language/apiv2/languagepb"
+	language "cloud.google.com/go/language/apiv1"
+	"cloud.google.com/go/language/apiv1/languagepb"
 	"github.com/KLIXPERT-io/text-cli/internal/config"
 	"github.com/KLIXPERT-io/text-cli/internal/errs"
 	"google.golang.org/api/option"
@@ -31,7 +31,14 @@ func init() {
 	Register(ProviderGoogle, func() (Provider, error) { return &googleProvider{}, nil })
 }
 
-// googleProvider wraps the Cloud Natural Language API v2.
+// googleProvider wraps the Cloud Natural Language API v1.
+//
+// v1, not v2, on purpose: v2 dropped Entity.salience, and salience — how
+// central an entity is to its document — is the whole point of the entity
+// output. v1 also still populates the `wikipedia_url` and `mid` metadata that
+// the knowledge-database work keys off. What v1 does not have is a per-mention
+// probability, so Entity.Probability stays 0 for this backend and ranking runs
+// off Entity.Score, which prefers salience.
 //
 // The client is created on first use, not in the factory: constructing it opens
 // a gRPC connection and resolves credentials, and `text entities --help` should
@@ -61,8 +68,9 @@ func (p *googleProvider) AnalyzeEntities(ctx context.Context, text string, opts 
 		Document: &languagepb.Document{
 			Type:   languagepb.Document_PLAIN_TEXT,
 			Source: &languagepb.Document_Content{Content: text},
-			// An empty LanguageCode asks the API to detect the language.
-			LanguageCode: opts.Language,
+			// An empty Language asks the API to detect it. (v2 spelled this
+			// field language_code; v1 spells it language.)
+			Language: opts.Language,
 		},
 		// UTF8 makes mention offsets byte offsets into the text we sent, which
 		// is what a Go caller can slice with directly.
@@ -250,12 +258,17 @@ func translateTransport(err error) error {
 // It is pure and total — nil-safe on every nested pointer — so the mapping is
 // unit-testable without a network or a credential.
 func convertResponse(resp *languagepb.AnalyzeEntitiesResponse) *Result {
-	out := &Result{Provider: ProviderGoogle, Entities: []Entity{}}
+	// v1 has no language_supported flag: it refuses an unsupported language with
+	// InvalidArgument (translated to CodeUnsupportedLanguage) rather than
+	// answering best-effort, so a response in hand means the language was
+	// supported. The JSON key stays, always true for this backend, because
+	// consumers documented against it must keep parsing.
+	out := &Result{Provider: ProviderGoogle, LanguageSupported: true, Entities: []Entity{}}
 	if resp == nil {
 		return out
 	}
-	out.Language = resp.GetLanguageCode()
-	out.LanguageSupported = resp.GetLanguageSupported()
+	// v2 called this language_code; v1 calls it language.
+	out.Language = resp.GetLanguage()
 	for _, pe := range resp.GetEntities() {
 		if pe == nil {
 			continue
@@ -269,6 +282,9 @@ func convertEntity(pe *languagepb.Entity) Entity {
 	e := Entity{
 		Name: pe.GetName(),
 		Type: pe.GetType().String(),
+		// Salience arrives as a float32 in [0, 1] whose widening to float64 is
+		// noisy; four decimals is all the ranking carries.
+		Salience: Round4(float64(pe.GetSalience())),
 	}
 	if md := pe.GetMetadata(); len(md) > 0 {
 		e.Metadata = make(map[string]string, len(md))
@@ -282,18 +298,15 @@ func convertEntity(pe *languagepb.Entity) Entity {
 		if pm == nil {
 			continue
 		}
-		m := Mention{
+		// v1's EntityMention has no Probability field — that was a v2 addition —
+		// so Mention.Probability and Entity.Probability stay 0 here. Filling
+		// them from salience would be a lie: salience is importance, not
+		// confidence. Ranking uses Entity.Score, which falls back to salience.
+		e.Mentions = append(e.Mentions, Mention{
 			Text:        pm.GetText().GetContent(),
 			Type:        pm.GetType().String(),
 			BeginOffset: int(pm.GetText().GetBeginOffset()),
-			Probability: float64(pm.GetProbability()),
-		}
-		// v2 dropped salience, so the only confidence signal left is per
-		// mention. The strongest mention is the entity's probability.
-		if m.Probability > e.Probability {
-			e.Probability = m.Probability
-		}
-		e.Mentions = append(e.Mentions, m)
+		})
 	}
 	e.MentionCount = len(e.Mentions)
 

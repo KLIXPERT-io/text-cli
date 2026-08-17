@@ -2,6 +2,18 @@
 
 Pick the path that fits your platform. All install methods deliver the same statically-linked `text` binary.
 
+## What needs credentials, and what does not
+
+Most of the CLI is pure local computation and works the moment the binary is on your `PATH`:
+
+| command | needs |
+|---|---|
+| `readability`, `lint`, `diff`, `metrics`, `config`, `update` | nothing — no network, no key |
+| `kb lookup`, `kb search` | network only; the public Wikipedia API takes no credentials |
+| `entities`, `sentiment`, `classify` | Google Cloud credentials, and the Cloud Natural Language API enabled on the project |
+
+So `text readability`, `text lint`, and `text diff` are usable straight after install; only the three Cloud Natural Language commands need setting up. See [Google credentials](./README.md#google-credentials-only-for-entities-sentiment-classify) in the README for the credential chain, and note that the shared `entities.*` config section governs all three.
+
 ## macOS / Linux — one-liner
 
 ```sh

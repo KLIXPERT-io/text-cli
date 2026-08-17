@@ -10,10 +10,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/KLIXPERT-io/text-cli/internal/analyze"
 	"github.com/KLIXPERT-io/text-cli/internal/config"
 	"github.com/KLIXPERT-io/text-cli/internal/errs"
 	"github.com/KLIXPERT-io/text-cli/internal/input"
 	"github.com/KLIXPERT-io/text-cli/internal/output"
+	"github.com/KLIXPERT-io/text-cli/internal/textproc"
 	"github.com/spf13/cobra"
 )
 
@@ -99,7 +101,9 @@ func rdRequireCode(t *testing.T, err error, want errs.Code, wantExit int) {
 // are written against exactly these keys.
 func TestReadabilitySingleDocumentJSON(t *testing.T) {
 	f := rdWriteTemp(t, "doc.txt", rdEnglishSample)
-	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--output", "json")
+	// Pinned to one metric: the shape of a result is what this test is about,
+	// and it must not change every time a formula joins the registry.
+	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "flesch", "--output", "json")
 	if err != nil {
 		t.Fatalf("readability: %v\n%s", err, out)
 	}
@@ -189,10 +193,16 @@ func TestReadabilityJSONLBatchResolvesLanguagePerDocument(t *testing.T) {
 	if len(data.Documents) != 2 {
 		t.Fatalf("documents = %d, want 2", len(data.Documents))
 	}
-	want := []struct{ id, lang, metric string }{
+	want := []struct{ id, lang, flagship string }{
 		{"de-1", "de", "amstad"},
 		{"en-1", "en", "flesch"},
 	}
+	// The assertion is about the *rule*, not about today's metric list: every
+	// metric a row was scored with must declare that row's language, and the
+	// language-specific metrics of the two rows must not overlap at all. A new
+	// formula joining the registry cannot break this without breaking the
+	// per-document resolution it is testing.
+	specific := make([]map[string]bool, len(want))
 	for i, w := range want {
 		got := data.Documents[i]
 		if got.ID != w.id {
@@ -204,12 +214,37 @@ func TestReadabilityJSONLBatchResolvesLanguagePerDocument(t *testing.T) {
 		if !got.LanguageDetected {
 			t.Fatalf("doc %d should be marked as detected", i)
 		}
-		if len(got.Metrics) != 1 || got.Metrics[0].Metric != w.metric {
-			t.Fatalf("doc %d metrics = %+v, want %s", i, got.Metrics, w.metric)
+		if len(got.Metrics) == 0 {
+			t.Fatalf("doc %d was scored with nothing", i)
 		}
-		if got.Metrics[0].Language != w.lang {
-			t.Fatalf("doc %d metric language = %q, want %q", i, got.Metrics[0].Language, w.lang)
+		specific[i] = map[string]bool{}
+		names := map[string]bool{}
+		for _, r := range got.Metrics {
+			names[r.Metric] = true
+			m, ok := analyze.Get(r.Metric)
+			if !ok {
+				t.Fatalf("doc %d was scored with unregistered metric %q", i, r.Metric)
+			}
+			if !m.Supports(textproc.Language(w.lang)) {
+				t.Fatalf("doc %d (%s) was scored with %q, which supports %v",
+					i, w.lang, r.Metric, m.Languages)
+			}
+			if !m.Supports(textproc.Language(analyze.AnyLanguage)) {
+				specific[i][r.Metric] = true
+			}
 		}
+		if !names[w.flagship] {
+			t.Fatalf("doc %d metrics %v are missing the %s formula for %s", i, names, w.flagship, w.lang)
+		}
+	}
+	for name := range specific[0] {
+		if specific[1][name] {
+			t.Fatalf("metric %q was applied to both the German and the English row; "+
+				"a language-specific formula must not cross rows", name)
+		}
+	}
+	if len(specific[0]) == 0 || len(specific[1]) == 0 {
+		t.Fatalf("each row should carry at least one language-specific metric, got %v and %v", specific[0], specific[1])
 	}
 	if env.Meta.Documents != 2 {
 		t.Fatalf("meta.documents = %d, want 2", env.Meta.Documents)
@@ -257,14 +292,29 @@ func TestReadabilityNDJSONPassesFieldsThrough(t *testing.T) {
 
 func TestReadabilityCSVColumns(t *testing.T) {
 	f := rdWriteTemp(t, "doc.txt", rdEnglishSample)
-	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--output", "csv")
+	// Metric columns follow the order given to --metrics, so an explicit
+	// selection pins the header exactly.
+	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "flesch,lix", "--output", "csv")
 	if err != nil {
 		t.Fatalf("readability: %v\n%s", err, out)
 	}
 	header := strings.SplitN(strings.TrimSpace(out), "\n", 2)[0]
-	want := "id,language,words,sentences,syllables,avg_sentence_length,avg_syllables_per_word,flesch,flesch_level"
+	want := "id,language,words,sentences,syllables,avg_sentence_length,avg_syllables_per_word,flesch,flesch_level,lix,lix_level"
 	if header != want {
 		t.Fatalf("csv header = %q, want %q", header, want)
+	}
+
+	// Under auto every metric valid for the language gets a pair of columns.
+	out, err = rdRun(t, "readability", "--file", f, "--lang", "en", "--output", "csv")
+	if err != nil {
+		t.Fatalf("readability: %v\n%s", err, out)
+	}
+	header = strings.SplitN(strings.TrimSpace(out), "\n", 2)[0]
+	for _, m := range analyze.ForLanguage("en") {
+		if !strings.Contains(header, ","+m.Name+","+m.Name+"_level") &&
+			!strings.HasSuffix(header, ","+m.Name+","+m.Name+"_level") {
+			t.Fatalf("csv header %q is missing the %s columns", header, m.Name)
+		}
 	}
 }
 
@@ -296,7 +346,7 @@ func TestReadabilityWithoutStats(t *testing.T) {
 
 func TestReadabilityUnknownMetric(t *testing.T) {
 	f := rdWriteTemp(t, "doc.txt", rdEnglishSample)
-	_, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "gunning-fog")
+	_, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "dale-chall")
 	rdRequireCode(t, err, errs.CodeUnknownMetric, 5)
 	var e *errs.E
 	errors.As(err, &e)
@@ -370,6 +420,177 @@ func TestMetricsListAndShow(t *testing.T) {
 
 	_, err = rdRun(t, "metrics", "show", "nope")
 	rdRequireCode(t, err, errs.CodeUnknownMetric, 5)
+}
+
+// ---------------------------------------------------------------------------
+// --fail-under / --fail-over
+// ---------------------------------------------------------------------------
+
+// rdHardSample scores far below any sensible reading-ease threshold and far
+// above any sensible grade-level one: one long sentence of long words.
+const rdHardSample = "The multidimensional interoperability considerations subsequently necessitate " +
+	"comprehensive organizational restructuring initiatives throughout the international " +
+	"telecommunications infrastructure administration."
+
+// A passing gate returns no error at all, and the output is unaffected by the
+// flag being present.
+func TestReadabilityFailUnderPasses(t *testing.T) {
+	f := rdWriteTemp(t, "doc.txt", rdEnglishSample)
+	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "flesch", "--fail-under", "10")
+	if err != nil {
+		t.Fatalf("a document above the threshold must pass: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, `"metric": "flesch"`) {
+		t.Fatalf("output should be unchanged by a passing gate:\n%s", out)
+	}
+}
+
+// A failing gate still prints every number — a CI job needs the scores that
+// failed it — and reports the failure through the error, which carries the
+// distinct generic exit code 1 rather than an argument-error 5.
+func TestReadabilityFailUnderFails(t *testing.T) {
+	f := rdWriteTemp(t, "doc.txt", rdHardSample)
+	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "flesch", "--fail-under", "60")
+	rdRequireCode(t, err, errs.CodeGeneric, 1)
+
+	if !strings.Contains(out, `"metric": "flesch"`) {
+		t.Fatalf("the scores must still reach stdout on a failed gate:\n%s", out)
+	}
+	var e *errs.E
+	errors.As(err, &e)
+	if !strings.Contains(e.Message, "flesch") || !strings.Contains(e.Message, "fail-under 60") {
+		t.Fatalf("message should name the metric and the threshold, got %q", e.Message)
+	}
+}
+
+// The mirror flag for grade levels: --fail-over trips when the score is too
+// HIGH, because a higher grade level is a harder text.
+func TestReadabilityFailOverOnGradeLevel(t *testing.T) {
+	f := rdWriteTemp(t, "doc.de.txt", rdGermanSample)
+	out, err := rdRun(t, "readability", "--file", f, "--lang", "de", "--metrics", "wstf", "--fail-over", "20")
+	if err != nil {
+		t.Fatalf("a simple German sentence is well under grade 20: %v\n%s", err, out)
+	}
+
+	f = rdWriteTemp(t, "hard.txt", rdHardSample)
+	_, err = rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "ari", "--fail-over", "8")
+	rdRequireCode(t, err, errs.CodeGeneric, 1)
+	var e *errs.E
+	errors.As(err, &e)
+	if !strings.Contains(e.Message, "ari") || !strings.Contains(e.Message, "fail-over 8") {
+		t.Fatalf("message should name the metric and the threshold, got %q", e.Message)
+	}
+}
+
+// The trap the two flags exist to prevent: --fail-under on a grade-level metric
+// would be satisfied by every text and pass CI for the wrong reason. It is an
+// argument error naming the flag that would have worked, in both directions.
+func TestReadabilityGateWrongDirection(t *testing.T) {
+	de := rdWriteTemp(t, "doc.de.txt", rdGermanSample)
+	en := rdWriteTemp(t, "doc.txt", rdEnglishSample)
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantFlag   string // the flag the hint must recommend
+		wantMetric string
+	}{
+		{"fail-under on wstf", []string{"--file", de, "--lang", "de", "--metrics", "wstf", "--fail-under", "8"}, "fail-over", "wstf1"},
+		{"fail-under on lix", []string{"--file", en, "--lang", "en", "--metrics", "lix", "--fail-under", "40"}, "fail-over", "lix"},
+		{"fail-under on smog", []string{"--file", en, "--lang", "en", "--metrics", "smog", "--fail-under", "9"}, "fail-over", "smog"},
+		{"fail-over on flesch", []string{"--file", en, "--lang", "en", "--metrics", "flesch", "--fail-over", "60"}, "fail-under", "flesch"},
+		{"fail-over on amstad", []string{"--file", de, "--lang", "de", "--metrics", "amstad", "--fail-over", "60"}, "fail-under", "amstad"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := rdRun(t, append([]string{"readability"}, tt.args...)...)
+			rdRequireCode(t, err, errs.CodeInvalidArgs, 5)
+			var e *errs.E
+			errors.As(err, &e)
+			if !strings.Contains(e.Message, tt.wantMetric) {
+				t.Fatalf("message should name the metric %q, got %q", tt.wantMetric, e.Message)
+			}
+			if !strings.Contains(e.Hint, "--"+tt.wantFlag) {
+				t.Fatalf("hint should point at --%s, got %q", tt.wantFlag, e.Hint)
+			}
+		})
+	}
+}
+
+// Under --metrics auto the selection is the registry's, not the user's, so a
+// gate applies to the metrics it fits and leaves the others alone instead of
+// rejecting the run.
+func TestReadabilityGateUnderAutoIgnoresTheOtherDirection(t *testing.T) {
+	f := rdWriteTemp(t, "doc.txt", rdEnglishSample)
+	// English auto covers both directions: flesch (higher is easier) plus the
+	// grade-level pack and lix (lower is easier).
+	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--fail-under", "10")
+	if err != nil {
+		t.Fatalf("auto selection must not turn a one-directional gate into an error: %v\n%s", err, out)
+	}
+	// And the gate is still live: a threshold nothing can meet fails.
+	_, err = rdRun(t, "readability", "--file", f, "--lang", "en", "--fail-under", "200")
+	rdRequireCode(t, err, errs.CodeGeneric, 1)
+}
+
+// Both flags at once gate both families in a single run.
+func TestReadabilityBothGatesTogether(t *testing.T) {
+	f := rdWriteTemp(t, "doc.txt", rdEnglishSample)
+	out, err := rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "flesch,ari",
+		"--fail-under", "10", "--fail-over", "20")
+	if err != nil {
+		t.Fatalf("both thresholds are met: %v\n%s", err, out)
+	}
+
+	_, err = rdRun(t, "readability", "--file", f, "--lang", "en", "--metrics", "flesch,ari",
+		"--fail-under", "200", "--fail-over", "0")
+	rdRequireCode(t, err, errs.CodeGeneric, 1)
+	var e *errs.E
+	errors.As(err, &e)
+	if !strings.Contains(e.Message, "flesch") || !strings.Contains(e.Message, "ari") {
+		t.Fatalf("both failures should be reported, got %q", e.Message)
+	}
+}
+
+// In a batch, one bad document fails the run, and the message says how many of
+// how many failed — that count is what a CI log is read for.
+func TestReadabilityGateBatchReportsFailureCount(t *testing.T) {
+	lines := strings.Join([]string{
+		`{"id":"ok-1","text":` + rdMustJSON(rdEnglishSample) + `}`,
+		`{"id":"bad","text":` + rdMustJSON(rdHardSample) + `}`,
+		`{"id":"ok-2","text":"The cat sat on the mat. The dog ran fast."}`,
+	}, "\n") + "\n"
+	f := rdWriteTemp(t, "batch.jsonl", lines)
+
+	out, err := rdRun(t, "readability", "--file", f, "--input-format", "jsonl", "--lang", "en",
+		"--metrics", "flesch", "--fail-under", "50", "--output", "json")
+	rdRequireCode(t, err, errs.CodeGeneric, 1)
+
+	var e *errs.E
+	errors.As(err, &e)
+	if !strings.Contains(e.Message, "1 of 3") {
+		t.Fatalf("message should count the failing documents, got %q", e.Message)
+	}
+	// Every document's numbers are still on stdout, including the passing ones.
+	for _, id := range []string{"ok-1", "bad", "ok-2"} {
+		if !strings.Contains(out, `"id": "`+id+`"`) {
+			t.Fatalf("document %q is missing from the output:\n%s", id, out)
+		}
+	}
+
+	// A threshold every document meets passes the whole batch.
+	if _, err := rdRun(t, "readability", "--file", f, "--input-format", "jsonl", "--lang", "en",
+		"--metrics", "flesch", "--fail-under", "-500", "--output", "json"); err != nil {
+		t.Fatalf("no document is below −500: %v", err)
+	}
+}
+
+// Without the flags nothing is gated, however bad the text is.
+func TestReadabilityNoGateWithoutFlags(t *testing.T) {
+	f := rdWriteTemp(t, "hard.txt", rdHardSample)
+	if _, err := rdRun(t, "readability", "--file", f, "--lang", "en"); err != nil {
+		t.Fatalf("scoring is not gating: %v", err)
+	}
 }
 
 func rdMustJSON(s string) string {

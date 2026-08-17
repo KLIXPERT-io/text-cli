@@ -202,7 +202,7 @@ func (c *Config) Set(key, value string) error {
 	switch key {
 	case "defaults.output":
 		if value != "" && !validOutput(value) {
-			return fmt.Errorf("defaults.output must be json, ndjson, csv, table, or text")
+			return fmt.Errorf("defaults.output must be json, toon, ndjson, csv, table, or text")
 		}
 		c.Defaults.Output = value
 	case "defaults.lang":
@@ -242,9 +242,13 @@ func (c *Config) Set(key, value string) error {
 	return c.Save()
 }
 
+// validOutput gates defaults.output. It deliberately mirrors output.Valid
+// rather than calling it: internal/config must not import internal/output, and
+// a format added there without being added here is a silently rejected config
+// key. Keep the two in step.
 func validOutput(v string) bool {
 	switch v {
-	case "json", "ndjson", "csv", "table", "text":
+	case "json", "toon", "ndjson", "csv", "table", "text":
 		return true
 	}
 	return false
