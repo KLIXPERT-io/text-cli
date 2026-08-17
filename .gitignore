@@ -1,0 +1,17 @@
+# Binaries
+/text
+/dist/
+*.exe
+*.test
+*.out
+
+# Local credentials (must never be committed)
+service-account*.json
+service_account*.json
+*-sa.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
