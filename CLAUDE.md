@@ -20,8 +20,12 @@ internal/entity/               provider-neutral entity types + registry + Google
 internal/knowledge/            knowledge-source registry + Wikipedia backend
 internal/firecrawl/            shared Firecrawl HTTP client: key resolution and
                                  error translation, no domain types
-internal/fetch/                Fetcher registry + Firecrawl scrape backend;
-                                 backs `text fetch` and the global --url
+internal/fetch/                Fetcher registry + Firecrawl scrape backend +
+                                 Google Docs backend; backs `text fetch` and
+                                 the global --url, routed per URL
+internal/gdocs/                Google Docs: Docs API for text, Drive API for
+                                 comments, service-account auth, the
+                                 Document→markdown converter
 internal/research/             research-source registry + Firecrawl papers
                                  backend; SearchPapers is required, inspect and
                                  related-work are capability interfaces
@@ -42,7 +46,7 @@ skills/text-cli/                agent skill shipped with the CLI:
                                  (loaded on demand)
 ```
 
-Commands: `readability`, `lint` (+ `lint rules`), `diff`, `metrics`, `entities`, `sentiment`, `classify`, `kb` (+ `lookup`, `search`), `fetch`, `research` (+ `papers`, `paper`, `similar`), `config`, `update`.
+Commands: `readability`, `lint` (+ `lint rules`), `diff`, `metrics`, `entities`, `sentiment`, `classify`, `kb` (+ `lookup`, `search`), `fetch`, `docs` (+ `read`, `comments`, `comment`, `reply`, `replace`, `insert`, `whoami`), `research` (+ `papers`, `paper`, `similar`), `config`, `update`.
 
 ## The one rule: register, don't wire
 
@@ -53,7 +57,7 @@ New capabilities declare themselves; nothing enumerates them. There are **six** 
 - **A lint rule** — `lint.Register(lint.Rule{...})` in `init()`, in `internal/lint/rules_*.go`. It appears in `text lint rules` and is selected by `--rules auto` for its languages. A rule *name* may be registered more than once for **disjoint** languages (German `passive` and English `passive` are different detectors under one name); overlapping languages panic at init.
 - **An entity provider** — one file in `internal/entity/` with `entity.Register(name, factory)` in `init()`. Only `Name()` and `AnalyzeEntities` are required. Sentiment and classification are **capability interfaces** (`SentimentAnalyzer`, `TextClassifier`) that a backend implements only if it can; commands ask via `RequireSentiment` / `RequireClassifier` and get a `provider_unavailable` error naming the backends that would have worked. Never add a method to `Provider`.
 - **A knowledge source** — one file in `internal/knowledge/` with `knowledge.Register(name, factory)` in `init()`. Backs `text kb` and `text entities --enrich`.
-- **A fetcher** — one file in `internal/fetch/` with `fetch.Register(name, factory)` in `init()`. Backs `text fetch` and the global `--url`. **It must return markdown, not plain text**: `State.LoadInput` runs every document through `internal/strip`, and a backend that pre-flattens hands the tokenizer a heading glued to the next sentence. That is what makes `--url` and `text fetch … | text …` produce identical scores and identical byte offsets. The API key arrives via the `APIConfigurer` capability interface, not via `Options` — a local headless-browser fetcher has no key.
+- **A fetcher** — one file in `internal/fetch/` with `fetch.Register(name, factory)` in `init()`. Backs `text fetch` and the global `--url`. **It must return markdown, not plain text**: `State.LoadInput` runs every document through `internal/strip`, and a backend that pre-flattens hands the tokenizer a heading glued to the next sentence. That is what makes `--url` and `text fetch … | text …` produce identical scores and identical byte offsets. Credentials arrive via capability interfaces, never via `Options`: `APIConfigurer` for an API key, `ServiceAccountConfigurer` for a Google key file. Two more capabilities live here: `URLMatcher` lets a backend claim the URLs only it can read (`fetch.ForURL`, how a Google Docs URL reaches the `gdocs` backend instead of the scraper), and `CacheTTLHinter` lets a backend opt out of the page cache (`gdocs` returns 0 — free to read, and mutable).
 - **A research source** — one file in `internal/research/` with `research.Register(name, factory)` in `init()`. `SearchPapers` is the only required method; `PaperInspector` and `SimilarFinder` are capability interfaces, asked for via `RequireInspector` / `RequireSimilarFinder`. Never add a method to `Source`.
 
 Every factory must stay cheap — no clients, no credentials, no network; `Open` calls it lazily, and `SentimentProviders()` constructs every registered provider just to type-assert on it.
@@ -63,6 +67,11 @@ Every factory must stay cheap — no clients, no credentials, no network; `Open`
 If you find yourself editing more than one file to add a feature of these kinds, you are working against the design. See `docs/EXTENDING.md`.
 
 ## House conventions
+
+- **`text docs` is the only thing that writes, and it is built like it.** Every other command reads text and prints numbers. The Google Docs write path is deliberately narrow — one literal replacement, one inserted paragraph — and three properties are load-bearing, not polish: the document is **read first** so an ambiguous `--find` is refused before anything is sent (`invalid_args`) and a `--find` that matches nothing is `not_found` rather than a successful no-op; every `batchUpdate` carries `writeControl.requiredRevisionId` from that read, so a concurrent edit is **rejected** instead of overwritten; and read commands ask for read-only scopes so their token cannot modify anything. Do not add a write that skips the read, and do not widen the surface to "apply this markdown" — the CLI must not become a document formatter.
+- **Comments are Drive, text is Docs.** The live Docs API v1 has no comment surface; `documents.get` cannot return one. Comments, replies, and resolving go through the Drive API's `comments`/`replies` resources, which is why a comment command asks for a Drive scope and a body read does not. A comment created through the API is unanchored — the editor's anchor is an opaque region descriptor no API can mint — so `docs comment` quotes the passage into the text instead of pretending otherwise.
+- **Two renderings of a document, on purpose.** `renderMarkdown` feeds the strip pass and every downstream command; `renderPlain` is the document's literal text and is what an occurrence count for `--find` is computed against. A search string that spans a bold word matches the document and would not match markdown with `**` in the middle of it. Both walk the same tree so neither can silently skip content.
+
 
 - **Stripping happens once, in `State.LoadInput`.** Markdown and HTML are reduced to prose there, before any command sees the text, defaulting to `--strip auto`. Never strip inside a command and never re-strip: `readability`, `lint`, and `diff` must not be able to disagree about what the document is. Scoring a fenced code block as prose is a real bug, not a rounding error — it moves this repo's own README a full Flesch band.
 - **Every command goes through `emitResult`.** Never `fmt.Println` to stdout. `emitResult` owns format resolution (`--output`, TTY detection), the envelope, and the TOON/CSV/table/NDJSON/text fallbacks. Fill in what your command can: `Data` is required, the rest degrade. TOON is free — it re-encodes the same `{Data, Meta}` envelope, so it cannot drift from the JSON unless someone bypasses `emitResult`.
@@ -75,6 +84,7 @@ If you find yourself editing more than one file to add a feature of these kinds,
 - **Language gates are load-bearing.** A metric's or rule's `Languages` field is what stops German prose being scored with English constants. Set it honestly; use `AnyLanguage` (`"*"`) only for genuinely language-agnostic work.
 - **Do not clamp scores**, only band labels — and only where the scale really ends. Reading ease clamps to 0–100 for the *label*; grade levels do not clamp, and a WSTF outside 4–15 is labelled `unter der Skala` / `über der Skala` rather than pretending to be `sehr leicht`.
 - **Paid calls are cached on the provider's inputs, never on the filters.** `entities`/`sentiment`/`classify` key on (provider, language, text), so changing `--top`, `--types`, or `--min-salience` re-filters a cached payload instead of paying again. `fetch` keys on (fetcher, URL, main-content, links) — deliberately *not* on `MaxAge`, which bounds staleness in Firecrawl's cache rather than in this one; including it would write two entries for one page. Keep it that way.
+- **A 404 from Google means "share it with me".** Google answers a request for a document the caller cannot see with 404 rather than 403, so an id cannot be probed for existence. Reported literally that reads as "not found" for a document the user has open in another tab. `internal/gdocs` turns it into a `not_found` whose hint names the service account address and asks for the document to be shared. Every access failure in that package ends there, and `text docs whoami` prints the same address on demand — a service account has no consent screen and cannot request access.
 - **Credentials come from the environment and the config, never from a flag.** There is no `--api-key`: a secret on the command line lands in shell history and in the process list. `config.Secret`/`config.Redact` fingerprint the key in `text config list`, because that output is what people paste into bug reports; `config get` still returns it in full.
 - **German is domain vocabulary, not localisation.** Amstad and WSTF level labels, and the German lint messages and suggestions, stay in German because that is what the formulas and the style guides call them. Do not translate them and do not add an i18n layer.
 - **Comments explain why, not what.** The existing files are the style reference: they justify the constants, the fallbacks, and the design choices, and skip narrating the code.

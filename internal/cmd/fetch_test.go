@@ -252,3 +252,71 @@ func TestIsFatalFetchErrSeparatesRepeatingFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestFetcherForRoutesPerURL(t *testing.T) {
+	const docURL = "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBd/edit"
+	const pageURL = "https://example.com/post"
+
+	tests := []struct {
+		name  string
+		state State
+		url   string
+		want  string
+	}{
+		{
+			// A Google Doc cannot be scraped at all, so the claim wins over the
+			// configured preference — routing it to the scraper would score a
+			// login page.
+			name:  "a document routes to the backend that claims it",
+			state: State{Cfg: config.Default()},
+			url:   docURL,
+			want:  fetch.FetcherGoogleDocs,
+		},
+		{
+			name:  "a claim beats the configured default",
+			state: State{Cfg: &config.Config{Fetch: config.Fetch{Provider: fetch.FetcherFirecrawl}}},
+			url:   docURL,
+			want:  fetch.FetcherGoogleDocs,
+		},
+		{
+			// An explicit --fetcher is the user naming a backend for this run.
+			name:  "an explicit --fetcher still wins",
+			state: State{Fetcher: fetch.FetcherFirecrawl, Cfg: config.Default()},
+			url:   docURL,
+			want:  fetch.FetcherFirecrawl,
+		},
+		{
+			name:  "an unclaimed URL falls through to the default",
+			state: State{Cfg: config.Default()},
+			url:   pageURL,
+			want:  fetch.Default(),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.state.fetcherFor(tc.url); got != tc.want {
+				t.Fatalf("fetcherFor(%q) = %q, want %q", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFetchTTLHonorsTheBackendsPolicy(t *testing.T) {
+	s := &State{Cfg: config.Default()}
+
+	scraper, err := fetch.Open(fetch.FetcherFirecrawl)
+	if err != nil {
+		t.Fatalf("open firecrawl: %v", err)
+	}
+	if got := s.fetchTTL(scraper); got <= 0 {
+		t.Fatalf("fetchTTL(firecrawl) = %v, want the configured page TTL — a billed scrape must be cached", got)
+	}
+
+	docs, err := fetch.Open(fetch.FetcherGoogleDocs)
+	if err != nil {
+		t.Fatalf("open gdocs: %v", err)
+	}
+	if got := s.fetchTTL(docs); got != 0 {
+		t.Fatalf("fetchTTL(gdocs) = %v, want 0 — a document being edited must not be served from a store", got)
+	}
+}

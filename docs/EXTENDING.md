@@ -613,16 +613,59 @@ Returning markdown is what makes `text readability --url X` and `text fetch X --
 
 ### Credentials go in a capability interface, not in `Options`
 
-`Options` is the whole contract, and everything in it is something *any* fetcher could act on: `MainContentOnly`, `IncludeLinks`, `MaxAge`, `Timeout`. An API key is not — a fetcher driving a local headless browser has none. So the credential arrives through an optional interface the command type-asserts for:
+`Options` is the whole contract, and everything in it is something *any* fetcher could act on: `MainContentOnly`, `IncludeLinks`, `MaxAge`, `Timeout`. A credential is not — a fetcher driving a local headless browser has none, and the two backends in this repo do not even take the same kind. So a credential arrives through an optional interface the command type-asserts for:
 
 ```go
 type APIConfigurer interface {
 	SetAPIKey(key string)
 	SetBaseURL(url string)
 }
+
+// A Google service account is a file path with no endpoint, which has nothing
+// in common with an API key and a base URL. A backend that needed both would
+// implement both.
+type ServiceAccountConfigurer interface {
+	SetServiceAccount(path string)
+}
 ```
 
-Implement it only if you need it. This is the same reasoning as `knowledge.TimeoutSetter`, and it is also what keeps factories cheap: the key is injected *after* construction, so `Register`'s "no credentials, no network" rule holds even though every backend needs one.
+Implement what you need and nothing else. This is the same reasoning as `knowledge.TimeoutSetter`, and it is also what keeps factories cheap: the credential is injected *after* construction, so `Register`'s "no credentials, no network" rule holds even though every backend needs one.
+
+### A backend can claim the URLs only it can read
+
+Choosing a fetcher is usually a preference. Sometimes it is not: a Google Doc cannot be scraped at all — the generic backend gets a login page and reports the sign-in form's reading level. So a backend can say which URLs are its own:
+
+```go
+// URLMatcher is the optional capability of owning a URL. Handles must be cheap
+// and must never claim a URL the backend cannot actually read: a false positive
+// turns a working scrape into an authentication error.
+type URLMatcher interface {
+	Handles(url string) bool
+}
+
+// ForURL names the fetcher that claims a URL, or "" if none does. It constructs
+// each registered backend to ask — affordable for exactly the reason Register
+// documents, and iterated in sorted name order so two claims resolve the same
+// way on every run.
+func ForURL(rawurl string) string
+```
+
+The command resolves per URL, so one invocation can mix a scraped article and a Google Doc. The precedence is in `State.fetcherFor`: an explicit `--fetcher` wins (the user named a backend for this run), then a claim (a statement that nothing else *can* read it), then `fetch.provider` from the config (a preference among backends that could all have answered), then `fetch.Default()`.
+
+### A backend can opt out of the page cache
+
+The page cache exists so a billed scrape is paid for once. A backend that costs nothing and reads a document somebody may be typing into right now gets nothing from it and loses correctness to it:
+
+```go
+// CacheTTLHinter overrides how long a fetched page may be reused. Zero means
+// the page is never stored and never served from the store. A backend that says
+// nothing keeps the configured TTL.
+type CacheTTLHinter interface {
+	CacheTTL() time.Duration
+}
+```
+
+`gdocs` returns 0. `firecrawl` does not implement it and keeps `cache.ttl_fetch`.
 
 ### House rules for a fetcher
 
@@ -802,6 +845,7 @@ Then add `newWordsCmd(),` to the `AddCommand` list. That is the entire wiring.
 | a lint rule | one file (or one `Register` call) in `internal/lint/` | none — `lint.Register` in `init()` |
 | a knowledge database | one file in `internal/knowledge/` | none — `knowledge.Register` in `init()` |
 | a URL-to-prose backend | one file in `internal/fetch/` | none — `fetch.Register` in `init()` |
+| an optional fetcher capability | `internal/fetch/fetch.go` | a new interface the command type-asserts for — never a method on `Fetcher` |
 | a literature index | one file in `internal/research/` | none — `research.Register` in `init()` |
 | an optional research capability | `internal/research/research.go` | a new interface plus a `RequireX` — never a method on `Source` |
 | a command | one file in `internal/cmd/` | one line in `Execute` |

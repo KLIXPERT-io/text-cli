@@ -122,9 +122,12 @@ Errors are a single JSON line on **stderr**, in every output format:
 | for | precedence, highest first |
 |---|---|
 | `entities`, `sentiment`, `classify` | `--service-account`, `TEXT_SERVICE_ACCOUNT`, `GOOGLE_APPLICATION_CREDENTIALS`, config `entities.service_account_path`, then Application Default Credentials |
-| `fetch`, `--url` | `FIRECRAWL_API_KEY`, then config `firecrawl.api_key` |
+| `fetch`, `--url` on a web page | `FIRECRAWL_API_KEY`, then config `firecrawl.api_key` |
+| `docs`, `--url` on a Google Doc | `--service-account`, `TEXT_SERVICE_ACCOUNT`, `GOOGLE_APPLICATION_CREDENTIALS`, config `docs.service_account_path`, then config `entities.service_account_path` — **plus the document shared with that service account** |
 
 `readability`, `lint`, `diff`, `metrics`, `kb`, and `research` need **no credentials at all**.
+
+A key alone does not open a Google Doc: the document must also be shared with the service account's address (`text docs whoami`). A `not_found` from a `docs` command means that sharing has not happened — Google returns 404 rather than 403 for a document the account cannot see. See [gdocs.md](gdocs.md).
 
 - The Google path additionally requires the Cloud Natural Language API to be enabled on the project. A configured path that does not exist is `auth_missing` rather than a silent fallback to ADC, so a typo surfaces immediately.
 - **There is deliberately no `--api-key` flag for Firecrawl.** A secret on the command line lands in shell history and the process list. `text config list` fingerprints the key (`…017f`); `text config get firecrawl.api_key` returns it in full.

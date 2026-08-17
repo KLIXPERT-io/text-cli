@@ -135,6 +135,63 @@ type APIConfigurer interface {
 	SetBaseURL(url string)
 }
 
+// ServiceAccountConfigurer is implemented by fetchers authenticated with a
+// Google service account key file rather than an API key.
+//
+// It is a second credential shape rather than a widening of APIConfigurer
+// because the two have nothing in common: a service account is a file path with
+// no endpoint, and a fetcher that wanted both would implement both. Same
+// reasoning as APIConfigurer itself — the credential arrives after
+// construction, so Register's "no credentials in a factory" rule still holds.
+type ServiceAccountConfigurer interface {
+	SetServiceAccount(path string)
+}
+
+// URLMatcher is the optional capability of owning a URL.
+//
+// It exists because a fetcher is not always a matter of preference. A Google
+// Doc cannot be scraped — the generic backend gets a login page — and a public
+// article does not need a Google credential. So a backend that is the only
+// possible answer for a URL says so, and the command routes to it instead of
+// making the user remember --fetcher.
+//
+// Handles must be cheap and must never claim a URL the backend cannot actually
+// read: a false positive turns a working scrape into an authentication error.
+// An explicit --fetcher always wins over a claim.
+type URLMatcher interface {
+	Handles(url string) bool
+}
+
+// CacheTTLHinter is the optional capability of overriding how long a fetched
+// page may be reused.
+//
+// The page cache exists to avoid paying twice for one scrape. A backend that
+// costs nothing and reads a document people are editing right now gets nothing
+// from it and loses correctness to it, so it returns 0 here and is never
+// stored. A backend that says nothing keeps the configured TTL.
+type CacheTTLHinter interface {
+	CacheTTL() time.Duration
+}
+
+// ForURL names the registered fetcher that claims a URL, or "" if none does.
+//
+// It constructs each registered backend to ask, which is affordable for exactly
+// the reason Register documents: factories are cheap. The iteration order is
+// the sorted name order, so two backends claiming one URL resolve the same way
+// on every run rather than depending on map ordering.
+func ForURL(rawurl string) string {
+	for _, name := range Names() {
+		f, err := Open(name)
+		if err != nil {
+			continue
+		}
+		if m, ok := f.(URLMatcher); ok && m.Handles(rawurl) {
+			return name
+		}
+	}
+	return ""
+}
+
 var (
 	mu        sync.RWMutex
 	factories = map[string]func() (Fetcher, error){}
