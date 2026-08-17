@@ -300,7 +300,10 @@ It reads text in and writes data out, so it composes:
 	pf.Int64Var(&st.MaxBytes, "max-bytes", input.DefaultMaxBytes, "maximum input size in bytes")
 	pf.StringVar(&st.Strip, "strip", string(strip.ModeAuto), "reduce markup to prose before analysis: auto|markdown|html|none")
 	pf.StringArrayVar(&st.URLs, "url", nil, "fetch a web page and analyse it (repeatable)")
-	pf.StringVar(&st.Fetcher, "fetcher", "", "backend for --url and `text fetch`: "+strings.Join(fetch.Names(), "|"))
+	// No backticks in this usage string: cobra reads a backquoted word as the
+	// flag's argument placeholder, so "`text fetch`" renders as "--fetcher text
+	// fetch" instead of "--fetcher string".
+	pf.StringVar(&st.Fetcher, "fetcher", "", "backend for --url and the fetch command: "+strings.Join(fetch.Names(), "|"))
 	pf.BoolVar(&st.MainContent, "main-content", true, "drop nav, headers, and footers from a fetched page")
 	pf.BoolVar(&st.NoCache, "no-cache", false, "bypass cache read and write")
 	pf.BoolVar(&st.Refresh, "refresh", false, "bypass cache read, write fresh result")

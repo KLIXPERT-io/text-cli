@@ -36,7 +36,10 @@ internal/cache/                disk cache with TTLs
 internal/logging/              stderr logging
 internal/update/               self-updater
 docs/EXTENDING.md              the seven extension recipes — read before adding anything
-skills/text-cli/SKILL.md       agent skill shipped with the CLI
+skills/text-cli/                agent skill shipped with the CLI:
+                                 SKILL.md is the router (loaded always) and
+                                 references/*.md one file per capability
+                                 (loaded on demand)
 ```
 
 Commands: `readability`, `lint` (+ `lint rules`), `diff`, `metrics`, `entities`, `sentiment`, `classify`, `kb` (+ `lookup`, `search`), `fetch`, `research` (+ `papers`, `paper`, `similar`), `config`, `update`.

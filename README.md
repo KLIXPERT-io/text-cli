@@ -37,7 +37,11 @@ After install, `text` keeps itself up to date in the background — see [INSTALL
 
 ## Use with local LLM agents (Claude, Gemini, …)
 
-`text` ships an agent skill that teaches LLM coding agents how to drive the CLI (commands, flags, the JSON envelope, exit codes, which metric fits which language, when to ask for TOON instead of JSON). Install it into any tool that supports the [`skills`](https://github.com/anthropics/skills) format:
+`text` ships an agent skill that teaches LLM coding agents how to drive the CLI (commands, flags, the JSON envelope, exit codes, which metric fits which language, when to ask for TOON instead of JSON).
+
+It is split for progressive disclosure: `SKILL.md` is a short router carrying only what is true of every command — input precedence, the envelope, exit codes, the cost of each backend — and one file per capability under `references/` that an agent reads only when the task needs it (`scoring`, `lint`, `entities`, `knowledge`, `web`, `research`, `io`). A readability question never loads the entity documentation.
+
+Install it into any tool that supports the [`skills`](https://github.com/anthropics/skills) format:
 
 ```bash
 npx skills add https://github.com/KLIXPERT-io/text-cli/skills --skill text-cli
