@@ -46,6 +46,14 @@ type Firecrawl struct {
 	BaseURL string `toml:"base_url"`
 }
 
+// Docs holds the credential for the Google Docs feature. It is its own section
+// rather than a key under Entities because the two use different Google APIs
+// and a user may well want a key scoped to one of them — but an empty value
+// falls back to the entities key, since one machine usually has one credential.
+type Docs struct {
+	ServiceAccountPath string `toml:"service_account_path"`
+}
+
 // Fetch names the backend `text fetch` and `--url` read pages through.
 type Fetch struct {
 	Provider string `toml:"provider"`
@@ -73,6 +81,7 @@ type Config struct {
 	Defaults   Defaults  `toml:"defaults"`
 	Entities   Entities  `toml:"entities"`
 	Firecrawl  Firecrawl `toml:"firecrawl"`
+	Docs       Docs      `toml:"docs"`
 	Fetch      Fetch     `toml:"fetch"`
 	Research   Research  `toml:"research"`
 	Cache      Cache     `toml:"cache"`
@@ -223,6 +232,8 @@ func (c *Config) Get(key string) (string, bool) {
 		return c.Firecrawl.APIKey, true
 	case "firecrawl.base_url":
 		return c.Firecrawl.BaseURL, true
+	case "docs.service_account_path":
+		return c.Docs.ServiceAccountPath, true
 	case "fetch.provider":
 		return c.Fetch.Provider, true
 	case "research.source":
@@ -269,6 +280,8 @@ func (c *Config) Set(key, value string) error {
 		c.Firecrawl.APIKey = strings.TrimSpace(value)
 	case "firecrawl.base_url":
 		c.Firecrawl.BaseURL = strings.TrimSpace(value)
+	case "docs.service_account_path":
+		c.Docs.ServiceAccountPath = value
 	case "fetch.provider":
 		c.Fetch.Provider = value
 	case "research.source":
@@ -333,6 +346,7 @@ func Keys() []string {
 		"entities.language",
 		"firecrawl.api_key",
 		"firecrawl.base_url",
+		"docs.service_account_path",
 		"fetch.provider",
 		"research.source",
 		"cache.dir",

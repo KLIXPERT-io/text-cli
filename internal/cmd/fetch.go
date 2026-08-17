@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -176,6 +177,25 @@ func (s *State) fetcherName() string {
 	return name
 }
 
+// fetcherFor resolves the backend for one URL.
+//
+// The order says what each layer means. An explicit --fetcher is the user
+// naming a backend for this run and wins over everything. A backend that claims
+// the URL comes next, because a claim is a statement that nothing else can read
+// it — a Google Doc is not a scrapeable page, and routing it to the default
+// would produce a login screen's readability score. Only then does the
+// configured default apply, since `fetch.provider` is a preference among
+// backends that could all have answered.
+func (s *State) fetcherFor(url string) string {
+	if name := strings.TrimSpace(s.Fetcher); name != "" {
+		return name
+	}
+	if name := fetch.ForURL(url); name != "" {
+		return name
+	}
+	return s.fetcherName()
+}
+
 // fetchOptions builds the per-call options from the shared flags.
 func (s *State) fetchOptions() fetch.Options {
 	opts := fetch.Options{
@@ -191,14 +211,15 @@ func (s *State) fetchOptions() fetch.Options {
 	return opts
 }
 
-// openFetcher resolves the backend and injects the credential and endpoint.
+// openFetcher resolves a backend by name and injects its credential.
 //
-// The key is set here rather than resolved inside the factory because
+// The credential is set here rather than resolved inside the factory because
 // fetch.Register documents factories as cheap: the registry constructs every
 // backend just to answer "which of you can do this", and a factory that read a
-// config file would make that expensive.
-func (s *State) openFetcher() (fetch.Fetcher, error) {
-	name := s.fetcherName()
+// config file would make that expensive. Which credential a backend gets is its
+// own declaration — an API key, a service account key, or neither — so this
+// asks rather than assumes.
+func (s *State) openFetcher(name string) (fetch.Fetcher, error) {
 	if name == "" {
 		return nil, errs.New(errs.CodeProviderUnavailable, "no fetcher is registered").
 			WithHint("This is a build problem, not a configuration one.")
@@ -215,6 +236,9 @@ func (s *State) openFetcher() (fetch.Fetcher, error) {
 		}
 		api.SetAPIKey(firecrawl.ResolveKey(configured))
 		api.SetBaseURL(base)
+	}
+	if sa, ok := f.(fetch.ServiceAccountConfigurer); ok {
+		sa.SetServiceAccount(s.serviceAccountPath(""))
 	}
 	return f, nil
 }
@@ -242,27 +266,38 @@ func (s *State) fetchPages(ctx context.Context, urls []string, opts fetch.Option
 		return nil, stats, nil
 	}
 
-	f, err := s.openFetcher()
-	if err != nil {
-		return nil, stats, err
-	}
-	name := f.Name()
-
 	type slot struct {
 		url     string
+		fetcher fetch.Fetcher
+		name    string
 		page    *fetch.Page
 		err     error
 		fetched bool
 	}
 	slots := make([]slot, len(urls))
+	// Each URL resolves to its own backend, so one command can mix a scraped
+	// article and a Google Doc. A backend is opened once and shared: opening
+	// resolves credentials, and doing that per URL would re-read a key file for
+	// every page.
+	opened := map[string]fetch.Fetcher{}
 	for i, u := range urls {
 		slots[i].url = u
+		slots[i].name = s.fetcherFor(u)
+		f, ok := opened[slots[i].name]
+		if !ok {
+			var err error
+			if f, err = s.openFetcher(slots[i].name); err != nil {
+				return nil, stats, err
+			}
+			opened[slots[i].name] = f
+		}
+		slots[i].fetcher = f
 	}
 
 	// Phase 1: the cache, serially.
 	var misses []int
 	for i := range slots {
-		if page, entry := s.fetchCacheGet(name, slots[i].url, opts); page != nil {
+		if page, entry := s.fetchCacheGet(slots[i].fetcher, slots[i].name, slots[i].url, opts); page != nil {
 			slots[i].page = page
 			stats.cacheHits++
 			if stats.oldest == nil || entry.CachedAt.Before(stats.oldest.CachedAt) {
@@ -285,7 +320,7 @@ func (s *State) fetchPages(ctx context.Context, urls []string, opts fetch.Option
 			go func() {
 				defer func() { done <- struct{}{} }()
 				for i := range jobs {
-					page, err := f.Fetch(ctx, slots[i].url, opts)
+					page, err := slots[i].fetcher.Fetch(ctx, slots[i].url, opts)
 					if err != nil {
 						slots[i].err = err
 						continue
@@ -310,7 +345,7 @@ func (s *State) fetchPages(ctx context.Context, urls []string, opts fetch.Option
 	// Phase 3: cache writes, serially.
 	for i := range slots {
 		if slots[i].fetched {
-			s.fetchCachePut(name, slots[i].url, opts, slots[i].page)
+			s.fetchCachePut(slots[i].fetcher, slots[i].name, slots[i].url, opts, slots[i].page)
 		}
 	}
 
@@ -362,8 +397,22 @@ func fetchCacheKey(name, url string, opts fetch.Options) string {
 	return cache.Key("fetch", args, "", "")
 }
 
-func (s *State) fetchCacheGet(name, url string, opts fetch.Options) (*fetch.Page, *cache.Entry) {
-	if s.Cache == nil || s.NoCache || s.Refresh {
+// fetchTTL is how long a page from this backend may be reused: the backend's
+// own hint when it has one, otherwise the configured page TTL. Zero means the
+// page is never stored and never served from the store.
+func (s *State) fetchTTL(f fetch.Fetcher) time.Duration {
+	if hinter, ok := f.(fetch.CacheTTLHinter); ok {
+		return hinter.CacheTTL()
+	}
+	ttl := 24 * time.Hour
+	if s.Cfg != nil {
+		ttl = s.Cfg.FetchTTL()
+	}
+	return s.TTLFor(ttl)
+}
+
+func (s *State) fetchCacheGet(f fetch.Fetcher, name, url string, opts fetch.Options) (*fetch.Page, *cache.Entry) {
+	if s.Cache == nil || s.NoCache || s.Refresh || s.fetchTTL(f) <= 0 {
 		return nil, nil
 	}
 	entry, err := s.Cache.Get(fetchCacheKey(name, url, opts))
@@ -377,22 +426,19 @@ func (s *State) fetchCacheGet(name, url string, opts fetch.Options) (*fetch.Page
 	return &page, entry
 }
 
-func (s *State) fetchCachePut(name, url string, opts fetch.Options, page *fetch.Page) {
-	if s.Cache == nil || s.NoCache || page == nil {
+func (s *State) fetchCachePut(f fetch.Fetcher, name, url string, opts fetch.Options, page *fetch.Page) {
+	ttl := s.fetchTTL(f)
+	if s.Cache == nil || s.NoCache || page == nil || ttl <= 0 {
 		return
 	}
-	ttl := 24 * time.Hour
-	if s.Cfg != nil {
-		ttl = s.Cfg.FetchTTL()
-	}
 	if payload, err := json.Marshal(page); err == nil {
-		_ = s.Cache.Put(fetchCacheKey(name, url, opts), payload, s.TTLFor(ttl))
+		_ = s.Cache.Put(fetchCacheKey(name, url, opts), payload, ttl)
 	}
 }
 
 func fetchMeta(name string, pages []*fetch.Page, stats fetchStats) output.Meta {
 	meta := output.Meta{
-		Provider:  name,
+		Provider:  providerOf(name, pages),
 		Documents: len(pages),
 		APICalls:  stats.apiCalls,
 	}
@@ -403,6 +449,36 @@ func fetchMeta(name string, pages []*fetch.Page, stats fetchStats) output.Meta {
 		meta.TTLRemainingSec = &sec
 	}
 	return meta
+}
+
+// providerOf names the backend (or backends) the pages actually came from.
+//
+// One run can now mix them — a Google Doc routes to the Docs backend while the
+// article next to it is scraped — so meta.provider is derived from the results
+// rather than from the flag. Each page still carries its own `fetcher` field;
+// this is the summary line for the envelope.
+func providerOf(fallback string, pages []*fetch.Page) string {
+	seen := make([]string, 0, 2)
+	for _, p := range pages {
+		if p == nil || p.Fetcher == "" {
+			continue
+		}
+		known := false
+		for _, s := range seen {
+			if s == p.Fetcher {
+				known = true
+				break
+			}
+		}
+		if !known {
+			seen = append(seen, p.Fetcher)
+		}
+	}
+	if len(seen) == 0 {
+		return fallback
+	}
+	sort.Strings(seen)
+	return strings.Join(seen, "+")
 }
 
 // pageRows is the CSV/table shape. The content is deliberately absent — a whole

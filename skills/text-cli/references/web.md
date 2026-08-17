@@ -43,9 +43,15 @@ A page: `url` (after redirects), `requested_url` (present **only when it differs
 | `--url <url>` | — | repeatable; available on every command |
 | `--links` | off | include the page's outbound links (`fetch` only) |
 | `--main-content` | on | drop nav, headers, and footers |
-| `--fetcher <name>` | `firecrawl` | which backend |
+| `--fetcher <name>` | `firecrawl` | which backend; a Google Docs URL routes to `gdocs` unless this names one |
 | `--timeout <duration>` | 60s | per-page deadline |
 | `--refresh` | off | bypass **both** caches — this CLI's and Firecrawl's |
+
+---
+
+## A Google Docs URL is not a scrape
+
+`docs.google.com/document/...` routes automatically to the Google Docs backend: free, never cached, and needing a service account rather than a Firecrawl key. Everything on this page still applies — `--url`, the strip pass, the envelope — but the credential, the cost, and the failure modes are different, and the document can also be edited. See [gdocs.md](gdocs.md).
 
 ---
 

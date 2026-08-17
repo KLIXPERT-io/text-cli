@@ -12,6 +12,7 @@ A fast, LLM-friendly Go CLI for text analysis. It reads prose from stdin, a file
 - Structured errors with machine-readable codes and distinct exit codes — never a stack trace, never a hang. `--fail-under` / `--fail-over` / `--fail-on-findings` turn any of it into a CI gate.
 - Named entities, sentiment, and content classification via the Google Cloud Natural Language API, behind a provider interface built for more backends. Wikipedia lookups via `text kb`, with no credentials at all.
 - **`--url` reads the web.** `text fetch` scrapes any page to clean prose via Firecrawl, and every analysis command takes `--url` directly — so `text entities --url https://…` works without a pipe. Pages are cached, so analysing one page three ways costs one scrape.
+- **`text docs` works with Google Docs.** Read a document as prose, read the comments on it, reply and resolve, replace a passage, insert a paragraph. A Google Docs URL routes there automatically, so `text lint --url <doc-url>` reports what to fix in a document — and `text docs replace` applies it. Access is granted by sharing the document with the CLI's service account, like a colleague.
 - **`text research`** searches scientific literature (arXiv, PubMed, DOI) and returns abstracts — which are prose, so the rest of the CLI composes straight onto them.
 - Six registries — metrics, entity providers, lint rules, knowledge sources, fetchers, research sources — so a new measurement, rule, or backend is one file that wires itself.
 - Local disk cache with TTLs, so re-running a paid analysis over unchanged text costs nothing.
@@ -86,6 +87,30 @@ Those three call the [Google Cloud Natural Language API v1](https://cloud.google
 
    A path that is configured but does not exist is an `auth_missing` error rather than a silent fallback to ADC, so a typo surfaces immediately instead of as a confusing permission error later.
 
+### Google Docs access (only for `text docs` and Google Docs URLs)
+
+`text docs` authenticates as a **service account**, and a service account sees a document only when the document has been shared with it — exactly like a colleague. There is no consent screen and no way for the CLI to grant itself access.
+
+1. **Enable both APIs** on a Google Cloud project: [Google Docs API](https://console.cloud.google.com/apis/library/docs.googleapis.com) and [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com). Drive is not optional: comments do not exist in the Docs API.
+2. **Create a service account and a JSON key**, exactly as above — the same key works for both features.
+3. **Point `text` at it**, then print the address to share with:
+
+   ```bash
+   text config set docs.service_account_path ~/secrets/text-sa.json
+   text docs whoami
+   # text-cli@your-project.iam.gserviceaccount.com
+   ```
+
+4. **Share the document with that address** — open it in Google Docs, click Share, paste the address, pick **Viewer** to read or **Editor** to write, and untick "Notify people".
+
+The credential chain is the shared one: `--service-account`, then `TEXT_SERVICE_ACCOUNT`, then `GOOGLE_APPLICATION_CREDENTIALS`, then `docs.service_account_path`, then `entities.service_account_path`. One machine usually has one Google credential, so a key already configured for `text entities` works here once the two APIs are enabled on its project.
+
+Google answers a request for a document you cannot see with **404, not 403** — deliberately, so an id cannot be probed. `text` reports that as what it almost always is, with the address to fix it already in the hint:
+
+```json
+{"error":{"code":"not_found","message":"the document is not available to this account: Requested entity was not found.","hint":"Google returns \"not found\" for a document that exists but has not been shared. Share the document with text-cli@your-project.iam.gserviceaccount.com as Viewer: …"}}
+```
+
 ### Firecrawl credentials (only for `--url` and `text fetch`)
 
 Fetching a page calls [Firecrawl](https://firecrawl.dev)'s scrape API, which renders JavaScript, follows redirects, and returns markdown rather than a tag soup. Get a key from the [dashboard](https://firecrawl.dev/app/api-keys), then set it either way — environment first, config second:
@@ -116,6 +141,7 @@ Check the [language support table](https://cloud.google.com/natural-language/doc
 | `classify` (`cls`) | content categories as taxonomy paths |
 | `kb lookup\|search` (`knowledge`) | Wikipedia descriptions and lead paragraphs |
 | `fetch` (`scrape`, `read`) | a web page as clean prose, ready for any other command |
+| `docs read\|comments\|comment\|reply\|replace\|insert\|whoami` (`gdocs`) | Google Docs: read, review, and edit |
 | `research papers\|paper\|similar` | scientific literature search, one paper by id, related work |
 | `config get\|set\|list\|path` | configuration |
 | `update status\|check\|apply` | self-update |
@@ -156,6 +182,14 @@ text fetch https://example.com/post --output text | text entities
 text readability --url https://example.com/post   # same thing, no pipe
 text lint --url https://example.com/post
 
+# Google Docs (service account, shared with the document)
+text docs whoami                                  # the address to share the document with
+text docs read <doc-url>
+text docs comments <doc-url>                      # open review threads, with the quoted passage
+text lint --url <doc-url>                         # what to fix, at byte offsets
+text docs replace <doc-url> --find "…" --replace "…"
+text docs reply <doc-url> <comment-id> "done" --resolve
+
 # Scientific literature (no credentials required)
 text research papers "how is text readability measured?"
 text research paper arxiv:1706.03762 --query "what is the attention mechanism?"
@@ -185,7 +219,7 @@ A terminal stdin with no arguments is an `empty_input` error, not a hang. The CL
 | `--lang auto\|en\|de` | analysis language; `auto` detects it |
 | `-f, --file <path>` | read the text from a file (`-` for stdin) |
 | `--url <url>` | fetch a web page and analyse it; repeatable |
-| `--fetcher <name>` | backend for `--url` and `text fetch` (default `firecrawl`) |
+| `--fetcher <name>` | backend for `--url` and `text fetch` (default `firecrawl`; a Google Docs URL routes to `gdocs` unless this names one) |
 | `--main-content` | drop nav, headers, and footers from a fetched page (default true) |
 | `--input-format text\|lines\|jsonl` | one document, one per line, or one JSON object per line |
 | `--text-field <name>` | JSONL field holding the text (default `text`) |
@@ -366,6 +400,67 @@ Two details worth knowing:
 - **Pages are cached for 24h**, keyed on the URL and the options that change the returned text — not on your output format or filters. Analysing one page for readability, entities, and lint costs one scrape. `--refresh` re-reads it, and also bypasses Firecrawl's own cache so you actually get a fresh page rather than their stored copy.
 
 A page that yields no text — a login wall, a canvas app — is an `empty_input` error naming the likely cause, not a silently empty document that a later command reports as a mystery.
+
+## Google Docs
+
+`text docs` is the same CLI pointed at a document instead of a file — and it is the one place `text` writes.
+
+```bash
+# The address to share documents with, before anything else works
+text docs whoami
+
+# The document, as markdown
+text docs read <doc-url>
+text docs read <doc-url> --output text > draft.md
+
+# The review threads, with the passage each one is anchored to
+text docs comments <doc-url>
+text docs comments <doc-url> --include-resolved --output table
+
+# Analyse it — no pipe, no temp file: a Google Docs URL routes to this backend
+text readability --url <doc-url> --lang de
+text lint --url <doc-url> --output text
+text diff --url <doc-before> --url <doc-after>
+
+# Edit it
+text docs replace <doc-url> --find "Die Inanspruchnahme" --replace "Wer die Leistung nutzt" --dry-run
+text docs replace <doc-url> --find "Die Inanspruchnahme" --replace "Wer die Leistung nutzt"
+text docs insert <doc-url> "Nachtrag: die Frist wurde verlängert."
+
+# Close the loop
+text docs reply <doc-url> <comment-id> "Umformuliert — Amstad von 31 auf 58." --resolve
+text docs comment <doc-url> --quote "Die Inanspruchnahme" --text "Substantivstil."
+```
+
+### The loop this exists for
+
+`text lint` reports an excerpt that is *exactly* the source text at the offsets it names. So the excerpt is the `--find` string, and applying a finding involves no index arithmetic at all:
+
+```bash
+text lint --url <doc-url> --output ndjson |
+  jq -r 'select(.severity == "warn") | .excerpt'
+# → feed one of those to:
+text docs replace <doc-url> --find "<excerpt>" --replace "<your rewrite>"
+```
+
+`text docs comments` closes the same loop from the human side: a reviewer's comment carries `quoted`, the passage it is attached to, and that is a literal substring of the document too.
+
+### What keeps a write safe
+
+- **An ambiguous `--find` is refused.** The document is read and the matches counted before anything is sent; a string that matches twice is an `invalid_args` error naming the count, not two rewrites. `--all` opts in.
+- **No match is `not_found`**, not a successful call that changed nothing — the failure mode where an agent moves on believing the edit landed.
+- **Every write pins the revision it read.** If anyone edited the document in between, Google rejects the batch and `text` tells you to re-run, rather than applying an edit computed against text that has moved.
+- **`--dry-run`** counts and validates without writing.
+- **Read commands hold read-only scopes.** `text docs read` and `text docs comments` authenticate with `documents.readonly` / `drive.readonly`: the token they hold cannot modify anything.
+
+### Limits worth knowing
+
+- **A new comment cannot be anchored to a passage.** The anchor the Docs editor writes is an opaque region descriptor no API can mint, so `text docs comment` posts a document-level comment; `--quote` puts the passage in the comment text. Replies and resolving work fully.
+- **`--find` cannot span a paragraph break** — Docs matches within a paragraph — and it is matched literally. Watch for autocorrect: the document may hold a curly quote or an em dash where your source had a straight one.
+- **Documents are never cached.** Reading one is free and it may be being typed into right now, so a stored copy would only ever be a way to be wrong. Every other `--url` page is still cached for 24h.
+- **Pending suggestions are left out by default** (`--suggestions clean`): the score of "the text plus everything anyone has proposed" is a score of a document that does not exist. `--suggestions accepted` reads it the other way.
+- **Images, equations, and footnote markers contribute no prose**, and a table of contents is skipped rather than counted a second time.
+- **Google Docs only.** A Sheets, Slides, or Forms URL is rejected by name, not with a puzzling "invalid id".
 
 ## Research: the literature
 
@@ -639,6 +734,9 @@ service_account_path = "~/secrets/text-sa.json"
 api_key = "fc-..."          # or export FIRECRAWL_API_KEY, which wins
 # base_url = "http://localhost:3002"   # a self-hosted Firecrawl
 
+[docs]
+service_account_path = "~/secrets/text-sa.json"   # empty falls back to [entities]
+
 [fetch]
 # provider = "firecrawl"    # empty lets the registry pick
 
@@ -661,6 +759,8 @@ Manage it with `text config get|set|list|path`. `text config list` prints every 
 
 The `entities` section also governs `sentiment` and `classify`: they share the provider, the credential chain, and `cache.ttl_entities`. Knowledge lookups (`text kb`, `--enrich`) use the same cache directory with a fixed 24h TTL; `--cache-ttl` overrides it per call.
 
+The `docs` section holds the Google Docs credential. Empty falls back to `entities.service_account_path`, so one key can serve both — the two features call different Google APIs, which is why the key can also be split if you want one scoped to each.
+
 The `firecrawl` section is shared by `text fetch`, `--url`, and `text research` — one account, one quota. `FIRECRAWL_API_KEY` beats the config file, so CI can override a stored key without editing it. `text config list` fingerprints the key rather than printing it.
 
 ## Roadmap / extending
@@ -673,12 +773,12 @@ The registries are the point. There are six, and each follows the same rule — 
 | entity providers | `internal/entity` | an entity backend, optionally sentiment and classification via capability interfaces |
 | lint rules | `internal/lint` | a check, visible in `text lint rules` and selected by `--rules auto` for its languages |
 | knowledge sources | `internal/knowledge` | a database behind `text kb` and `text entities --enrich` |
-| fetchers | `internal/fetch` | a way to turn a URL into prose, behind `text fetch` and `--url` |
+| fetchers | `internal/fetch` | a way to turn a URL into prose, behind `text fetch` and `--url`; optionally claiming the URLs only it can read |
 | research sources | `internal/research` | a literature index behind `text research`, with optional inspect and related-work capabilities |
 
 Each is one file with a `Register` call in `init()`: no command wiring, no switch statement, no list of features repeated anywhere.
 
-Shipped since 0.1.0: the lint engine, `diff`, `sentiment`, `classify`, ten more metrics, Markdown/HTML stripping, TOON output, knowledge-database lookups behind `text kb`, and — newest — **the web as an input source** (`text fetch`, `--url`) and **literature search** (`text research`), both on Firecrawl.
+Shipped since 0.1.0: the lint engine, `diff`, `sentiment`, `classify`, ten more metrics, Markdown/HTML stripping, TOON output, knowledge-database lookups behind `text kb`, **the web as an input source** (`text fetch`, `--url`) and **literature search** (`text research`) on Firecrawl, and — newest — **Google Docs** (`text docs`), the first feature that writes.
 
 Still ahead:
 
@@ -690,7 +790,8 @@ See [docs/EXTENDING.md](./docs/EXTENDING.md) for the extension recipes, with the
 
 ## Non-goals
 
-- No writes anywhere — `text` reads text and prints numbers and findings. It never rewrites your document; it tells a human or an LLM exactly where to.
+- **No writes except where you name the target.** Everything that measures text only reads it: `readability`, `lint`, `diff`, `entities`, `fetch` and the rest print numbers and findings and change nothing. The one exception is `text docs`, which edits a Google Doc you named, with a service account you configured, on a document somebody shared with it — and even there the write path is narrow (one literal replacement or one inserted paragraph), refuses an ambiguous match, and pins the revision it read so a concurrent edit is rejected rather than overwritten.
+- No rewriting on your behalf — `text` does not decide what your text should say. It tells a human or an LLM exactly where to change it.
 - No web UI, no daemon mode.
 - No visualisation — pipe CSV into your plotting tool of choice.
 

@@ -239,6 +239,8 @@ It reads text in and writes data out, so it composes:
   text lint --url https://example.com/post --output table
   text diff draft1.md draft2.md
   text fetch https://example.com/post --output text
+  text lint --url https://docs.google.com/document/d/<id>/edit
+  text docs comments <id>
   text research papers "how is readability measured?"
   jq -c '{id, text}' posts.jsonl | text readability --input-format jsonl --output ndjson`,
 		SilenceUsage:  true,
@@ -322,6 +324,7 @@ It reads text in and writes data out, so it composes:
 		newLintCmd(),
 		newKBCmd(),
 		newFetchCmd(),
+		newDocsCmd(),
 		newResearchCmd(),
 		newConfigCmd(),
 		newUpdateCmd(version),
