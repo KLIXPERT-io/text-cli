@@ -126,7 +126,8 @@ func (s *State) loadURLs(args []string) ([]string, error) {
 			st.InputFormat = string(input.FormatLines)
 		}
 		items, err := input.Load(input.Options{
-			File:     st.File,
+			Files:    st.Files,
+			From:     st.From,
 			Format:   input.Format(st.InputFormat),
 			MaxBytes: st.MaxBytes,
 		})

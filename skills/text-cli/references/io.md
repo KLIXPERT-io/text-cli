@@ -9,13 +9,69 @@ Everything shared by every command: where the text comes from, what the output l
 Precedence is fixed and identical for every command:
 
 1. `--url <url>` — repeatable. The page is fetched and then treated exactly like a file. See [web.md](web.md).
-2. `--file <path>` — `-` means stdin.
+2. `--file <path>` — repeatable. `-` means stdin.
 3. **positional arguments**, joined with a space into one document.
 4. **piped or redirected stdin.**
 
 A terminal stdin with no arguments is an `empty_input` error (exit 5), never a hang — the CLI does not silently wait for a human to type.
 
 Prefer `--file doc.md` over `cat doc.md | text …`, and `--url X` over `text fetch X | text …`. Both are one process instead of two, and both give the document a meaningful `id`.
+
+### Document formats
+
+`--file` reads PDF, DOCX, PPTX, ODT, ODS, EPUB and RTF directly. **Do not convert a document first** — no `pdftotext`, no `pandoc`, no unzipping a `.docx`, and do not tell the user to export it. Each is decoded to markdown, so headings and lists survive into the strip pass and the scores match the same text pasted in by hand. A converted-to-plain-text file loses the block structure and scores differently, usually worse.
+
+| `--from` | extensions | what it produces |
+|---|---|---|
+| `pdf` | `.pdf` | paragraphs, headings and lists rebuilt from glyph geometry; running headers and footers dropped; a word hyphenated across a line break rejoined |
+| `docx` | `.docx` `.docm` | headings from paragraph styles, lists, tables |
+| `pptx` | `.pptx` `.pptm` | one heading per slide title, one item per bullet; speaker notes deliberately not read |
+| `odt` | `.odt` `.fodt` | headings, lists, tables |
+| `ods` | `.ods` `.fods` | one heading per sheet, one row per row |
+| `epub` | `.epub` | chapters in spine order, not archive order |
+| `rtf` | `.rtf` | headings from outline levels, bullets recovered from the list text |
+
+Detection is by extension first, then by content, so stdin and a misnamed file both work:
+
+```bash
+text readability --file bericht.pdf --lang de
+text readability --file a.docx --file b.epub        # two documents, one call
+cat report.pdf | text lint --output ndjson
+text readability --file odd-name.bin --from docx    # force it
+```
+
+`--file` is repeatable — use it instead of a loop, exactly as you would use JSONL for a batch of strings.
+
+`--from text` disables decoding for the whole run — use it for a file that is real text but not valid UTF-8 (a latin-1 export), which `auto` would otherwise refuse as binary. It is the only way past that refusal, and it does not extend to bytes containing a NUL: `--from text --file report.docx` is still `invalid_args`, never a score over the compressed bytes.
+
+### Getting the text out — `extract`
+
+`text extract <file...>` prints the decoded markdown instead of measuring it. Use it when the user wants the *content* of a document, not a number about it: "read this PDF", "convert this docx to markdown", "what does this deck say".
+
+```bash
+text extract report.pdf                    # markdown on stdout
+text extract report.pdf --out report.md    # write it; refuses to overwrite without --force
+text extract a.docx b.pptx --out docs/     # a directory takes one .md per document
+text extract report.pdf --strip auto       # plain prose instead of markdown
+text extract report.pdf --output json      # envelope: file, format, title, chars, content
+```
+
+It is the **only** command that defaults to `--output text` rather than the JSON envelope, so it pipes cleanly. Do not pipe it into another `text` command to analyse it — `--file` does the same thing in one process and gives a better `id`. `--out` is the only file this CLI writes on the user's disk; an existing path is an `invalid_args` error, never a silent overwrite.
+
+Decoded documents add `format` and the document's own `title` as passthrough fields, plus `file` when there is more than one source. Read them from `--output ndjson`. There is **no page count in the output**: the decoders record one for PDF and PPTX, but no command emits it — do not report a page count you did not see.
+
+`--max-bytes` caps the **analysed text**, not the file: a document is decoded whole and then capped, so `meta.truncated` on a PDF means the extracted markdown was long, not that the file was. A container above a fixed 100 MiB ceiling is refused outright, as is one whose parts expand past 64 MiB while being decoded — that one reads as "expands to more than 64 MiB of text" and means the file is a compression bomb or a machine-generated dump, not that the prose is long.
+
+**Failure modes worth recognising.** None are retriable, and none should be answered with a score:
+
+| message | code / exit | meaning |
+|---|---|---|
+| `… is binary, not text` | `invalid_args`, 5 | no decoder claims it; the hint lists the extensions that work. Say so — do not fall back to a converter |
+| `… is a pre-2007 Office file (.doc/.xls/.ppt)` | `invalid_args`, 5 | tell the user to open it and save as `.docx`/`.xlsx`/`.pptx` |
+| `unknown input format: "x"` | `invalid_args`, 5 | a bad `--from`; the hint lists the valid names |
+| `cannot read PDF: …` (password) | `invalid_args`, 5 | password-protected. Stop; the CLI cannot open it |
+| `… decoded as pdf but contains no text` | `empty_input`, 5 | a scanned or image-only document. It needs OCR, which this CLI does not do. Do not retry, and do not report a score |
+| `no page of this PDF could be read` | `invalid_args`, 5 | corrupt or an unsupported encoding. A single bad page is skipped silently; this means every page failed |
 
 ### Batch input
 
@@ -26,7 +82,7 @@ Prefer `--file doc.md` over `cat doc.md | text …`, and `--url X` over `text fe
 | `--input-format jsonl` | one JSON object per line |
 | `--text-field <name>` | JSONL field holding the text (default `text`) |
 | `--id-field <name>` | JSONL field holding the id (default `id`) |
-| `--max-bytes <n>` | input size cap (default 10 MiB) |
+| `--max-bytes <n>` | cap on the analysed text (default 10 MiB); a document is decoded whole first |
 
 Sidecar JSONL fields are carried through into NDJSON output, so results join back to their source. Pair a batch with `--output ndjson`.
 
@@ -73,7 +129,7 @@ Reading `meta`:
 - **`cached` / `ttl_remaining_sec`** — served from the local cache. `cached` is only `true` when the *whole* batch came from cache. `--refresh` forces a fresh call, `--no-cache` bypasses the cache entirely, `--cache-ttl <duration>` overrides the TTL for one call.
 - **`api_calls`** — always `0` for `readability`, `lint`, `diff`, and `metrics`. They are pure computation.
 - **`provider`** — names the backend for commands that call one (`google`, `wikipedia`, `firecrawl`).
-- **`truncated`** — `--max-bytes` cut the input. Check it before trusting counts on a large file.
+- **`truncated`** — `--max-bytes` cut the input. Check it before trusting counts on a large file, and on a decoded document read it as "the extracted text was long", not "the file was".
 
 ### Choosing a format
 

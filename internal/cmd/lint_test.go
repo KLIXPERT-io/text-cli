@@ -44,7 +44,7 @@ func ltRun(t *testing.T, args ...string) (string, error) {
 	pf := root.PersistentFlags()
 	pf.StringVar(&st.OutputFormat, "output", "json", "output format")
 	pf.StringVar(&st.Lang, "lang", "", "analysis language")
-	pf.StringVarP(&st.File, "file", "f", "", "read text from a file")
+	pf.StringArrayVarP(&st.Files, "file", "f", nil, "read text from a file")
 	pf.StringVar(&st.InputFormat, "input-format", "text", "input format")
 	pf.StringVar(&st.TextField, "text-field", "text", "JSONL text field")
 	pf.StringVar(&st.IDField, "id-field", "id", "JSONL id field")

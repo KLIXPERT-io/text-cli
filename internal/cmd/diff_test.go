@@ -30,7 +30,7 @@ func dfRun(t *testing.T, args ...string) (string, error) {
 	pf := root.PersistentFlags()
 	pf.StringVar(&st.OutputFormat, "output", "json", "output format")
 	pf.StringVar(&st.Lang, "lang", "", "analysis language")
-	pf.StringVarP(&st.File, "file", "f", "", "read text from a file")
+	pf.StringArrayVarP(&st.Files, "file", "f", nil, "read text from a file")
 	pf.StringVar(&st.InputFormat, "input-format", "text", "input format")
 	pf.StringVar(&st.TextField, "text-field", "text", "JSONL text field")
 	pf.StringVar(&st.IDField, "id-field", "id", "JSONL id field")
@@ -58,7 +58,7 @@ func dfRunSplit(t *testing.T, args ...string) (stdout, stderr string, err error)
 	pf := root.PersistentFlags()
 	pf.StringVar(&st.OutputFormat, "output", "json", "output format")
 	pf.StringVar(&st.Lang, "lang", "", "analysis language")
-	pf.StringVarP(&st.File, "file", "f", "", "read text from a file")
+	pf.StringArrayVarP(&st.Files, "file", "f", nil, "read text from a file")
 	pf.StringVar(&st.InputFormat, "input-format", "text", "input format")
 	pf.StringVar(&st.TextField, "text-field", "text", "JSONL text field")
 	pf.StringVar(&st.IDField, "id-field", "id", "JSONL id field")
@@ -391,5 +391,66 @@ func TestDiffCSVColumns(t *testing.T) {
 	want := "metric,before,after,delta,improved,level_before,level_after"
 	if header != want {
 		t.Fatalf("csv header = %q, want %q", header, want)
+	}
+}
+
+// diff must reduce markup to prose exactly as readability and lint do.
+//
+// It is the one command that cannot call State.LoadInput — it loads two named
+// documents rather than one input source — so the strip pass is the thing it is
+// most likely to lose, and losing it is silent: a fenced code block scores as
+// several sentences of prose and every per-sentence average moves with it. The
+// case that matters most is a decoded document, because internal/doc hands over
+// markdown by contract, so an unstripped diff would score the "##" and the "|"
+// a PDF or a DOCX was turned into.
+func TestDiffStripsMarkupLikeEveryOtherCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{
+			name: "fenced code block is not prose",
+			text: "Ein einfacher Satz.\n\n```go\nfunc main() { fmt.Println(\"x\") }\nvar xyz = 12345\n```\n\nNoch ein Satz.\n",
+		},
+		{
+			name: "decoded document markdown: headings, items and table rows",
+			text: "## Einführung in die Maßnahme\n\nDer Absatz steht hier.\n\n- erster Punkt\n- zweiter Punkt\n\n| Zelle A | Zelle B |\n",
+		},
+		{
+			name: "html markup is reduced too",
+			text: "<h1>Überschrift</h1>\n<p>Ein Absatz mit Inhalt.</p>\n<p>Und noch einer dazu.</p>\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := dfWriteTemp(t, "doc.md", tc.text)
+
+			out, err := dfRun(t, "diff", path, path, "--lang", "de", "--metrics", "amstad", "--output", "json")
+			if err != nil {
+				t.Fatalf("diff: %v\n%s", err, out)
+			}
+			data := dfDecode(t, out)
+
+			// The reference is the same text put through the same strip pass and
+			// the same tokenizer, which is what every other command does with it.
+			st := &State{Cfg: config.Default()}
+			items := []input.Item{{ID: "0", Text: tc.text}}
+			st.stripItems(items)
+			want, err := textproc.Analyze(items[0].Text, textproc.LangGerman)
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+
+			if data.Before.Stats.Words != want.Stats.Words {
+				t.Fatalf("before words = %d, want %d (diff did not strip: %q)",
+					data.Before.Stats.Words, want.Stats.Words, items[0].Text)
+			}
+			if data.Before.Stats.Sentences != want.Stats.Sentences {
+				t.Fatalf("before sentences = %d, want %d", data.Before.Stats.Sentences, want.Stats.Sentences)
+			}
+			if data.After.Stats.Words != want.Stats.Words {
+				t.Fatalf("after words = %d, want %d", data.After.Stats.Words, want.Stats.Words)
+			}
+		})
 	}
 }

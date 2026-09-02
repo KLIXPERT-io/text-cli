@@ -15,10 +15,10 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/KLIXPERT-io/text-cli/internal/cache"
 	"github.com/KLIXPERT-io/text-cli/internal/config"
+	"github.com/KLIXPERT-io/text-cli/internal/doc"
 	"github.com/KLIXPERT-io/text-cli/internal/errs"
 	"github.com/KLIXPERT-io/text-cli/internal/fetch"
 	"github.com/KLIXPERT-io/text-cli/internal/input"
@@ -44,8 +44,10 @@ type State struct {
 	Refresh      bool
 	CacheTTL     time.Duration
 
-	// Input flags, shared by every analysis command.
-	File        string
+	// Input flags, shared by every analysis command. Files is repeatable so a
+	// batch of documents is one invocation rather than a shell loop.
+	Files       []string
+	From        string
 	InputFormat string
 	TextField   string
 	IDField     string
@@ -89,15 +91,32 @@ func getState(cmd *cobra.Command) *State {
 // the reason the fetcher returns markdown rather than plain text: the page
 // arrives as markup and is reduced by the code that already knows how, instead
 // of by a scraper's text extraction that would flatten headings into the
-// following sentence.
+// following sentence. A decoded document — a PDF, a DOCX — arrives here the
+// same way and for the same reason: internal/input hands over markdown, and
+// this pass reduces it. There is exactly one strip, here.
 func (s *State) LoadInput(ctx context.Context, args []string) ([]input.Item, error) {
 	items, err := s.loadRaw(ctx, args)
 	if err != nil {
 		return nil, err
 	}
+	s.stripItems(items)
+	return items, nil
+}
+
+// stripItems applies the strip pass in place.
+//
+// It is separate from LoadInput only because `text diff` cannot use LoadInput:
+// it loads two named documents rather than one input source. Sharing this is
+// what keeps the promise the package comment above makes — a fenced code block
+// is markup to `readability` and to `lint`, and it has to be markup to `diff`
+// too, or the two halves of a rewrite are compared on a rule neither command
+// applies. It is also what makes a decoded document work at all in `diff`: a
+// decoder hands over markdown, and unstripped markdown scores its own "##" and
+// "|" as prose.
+func (s *State) stripItems(items []input.Item) {
 	mode := strip.Mode(firstNonEmpty(s.Strip, string(strip.ModeAuto)))
 	if mode == strip.ModeNone {
-		return items, nil
+		return
 	}
 	for i := range items {
 		stripped := strip.Apply(items[i].Text, mode)
@@ -107,7 +126,6 @@ func (s *State) LoadInput(ctx context.Context, args []string) ([]input.Item, err
 			items[i].Text = stripped
 		}
 	}
-	return items, nil
 }
 
 // loadRaw resolves the input source before stripping. --url wins over the
@@ -117,7 +135,8 @@ func (s *State) loadRaw(ctx context.Context, args []string) ([]input.Item, error
 	if len(s.URLs) == 0 {
 		return input.Load(input.Options{
 			Args:      args,
-			File:      s.File,
+			Files:     s.Files,
+			From:      s.From,
 			Format:    input.Format(s.InputFormat),
 			TextField: s.TextField,
 			IDField:   s.IDField,
@@ -164,19 +183,10 @@ func (s *State) loadRaw(ctx context.Context, args []string) ([]input.Item, error
 // capText applies --max-bytes to fetched text, which otherwise bypasses the
 // limit that every other input source honours.
 //
-// It cuts on a rune boundary: a page truncated mid-UTF-8-sequence would hand
-// the tokenizer an invalid byte, and the resulting word count would be wrong in
-// a way nothing downstream could detect.
-func capText(s string, max int64) (string, bool) {
-	if max <= 0 || int64(len(s)) <= max {
-		return s, false
-	}
-	cut := int(max)
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut], true
-}
+// It is input.CapText, not a second copy: a decoded document is capped by the
+// same rune-boundary cut, and two implementations of that would eventually
+// disagree about where the boundary is.
+func capText(s string, max int64) (string, bool) { return input.CapText(s, max) }
 
 // isCode reports whether err is an *errs.E carrying the given code.
 func isCode(err error, code errs.Code) bool {
@@ -230,11 +240,20 @@ fenced code block or a URL never counts as a sentence. --strip none opts out.
 --url fetches a web page and analyses that, so any command that reads a file
 also reads a URL. Pages are scraped to clean prose and cached for 24h.
 
+A document file — PDF, DOCX, PPTX, ODT, EPUB — is decoded to markdown before
+it is measured, so the same commands read the file a colleague actually sent.
+--from names the decoder when the extension is wrong or absent; --from text
+turns decoding off. Binary input that no decoder reads is refused rather than
+scored. --file is repeatable, so a batch is one invocation.
+
 It reads text in and writes data out, so it composes:
 
   cat post.md | text readability --lang de
   text entities --file post.md --min-salience 0.02 --output csv
   text entities --url https://example.com/post
+  text readability --file report.pdf
+  text lint --file a.docx --file b.docx --output table
+  cat deck.pptx | text entities
   text readability --file post.md --output toon
   text lint --url https://example.com/post --output table
   text diff draft1.md draft2.md
@@ -262,6 +281,10 @@ It reads text in and writes data out, so it composes:
 			if st.Strip != "" && !strip.Valid(st.Strip) {
 				return errs.Newf(errs.CodeInvalidArgs, "unknown strip mode: %q", st.Strip).
 					WithHint("Use --strip " + strings.Join(strip.Modes(), ", ") + ".")
+			}
+			if st.From != "" && st.From != input.FromAuto && !doc.Registered(st.From) {
+				return errs.Newf(errs.CodeInvalidArgs, "unknown input format: %q", st.From).
+					WithHint("Use --from " + input.FromAuto + ", " + strings.Join(doc.FormatNames(), ", ") + ".")
 			}
 			if st.Fetcher != "" && !fetch.Registered(st.Fetcher) {
 				return errs.Newf(errs.CodeInvalidArgs, "unknown fetcher: %q", st.Fetcher).
@@ -295,11 +318,14 @@ It reads text in and writes data out, so it composes:
 	pf := root.PersistentFlags()
 	pf.StringVar(&st.OutputFormat, "output", "", "output format: json|toon|ndjson|csv|table|text (default: json, or table on TTY)")
 	pf.StringVar(&st.Lang, "lang", "", "analysis language: auto|en|de (default: auto)")
-	pf.StringVarP(&st.File, "file", "f", "", `read text from a file ("-" for stdin)`)
+	pf.StringArrayVarP(&st.Files, "file", "f", nil, `read text from a file, decoding a document format if it is one ("-" for stdin, repeatable)`)
+	// No backticks here either: cobra reads a backquoted word as the flag's
+	// argument placeholder.
+	pf.StringVar(&st.From, "from", input.FromAuto, "document format to decode: "+input.FromAuto+"|"+strings.Join(doc.FormatNames(), "|"))
 	pf.StringVar(&st.InputFormat, "input-format", "text", "input format: text|lines|jsonl")
 	pf.StringVar(&st.TextField, "text-field", "text", "JSONL field holding the text")
 	pf.StringVar(&st.IDField, "id-field", "id", "JSONL field holding the document id")
-	pf.Int64Var(&st.MaxBytes, "max-bytes", input.DefaultMaxBytes, "maximum input size in bytes")
+	pf.Int64Var(&st.MaxBytes, "max-bytes", input.DefaultMaxBytes, "maximum size in bytes of the analysed text (a document is decoded whole first)")
 	pf.StringVar(&st.Strip, "strip", string(strip.ModeAuto), "reduce markup to prose before analysis: auto|markdown|html|none")
 	pf.StringArrayVar(&st.URLs, "url", nil, "fetch a web page and analyse it (repeatable)")
 	// No backticks in this usage string: cobra reads a backquoted word as the
@@ -322,6 +348,7 @@ It reads text in and writes data out, so it composes:
 		newClassifyCmd(),
 		newDiffCmd(),
 		newLintCmd(),
+		newExtractCmd(),
 		newKBCmd(),
 		newFetchCmd(),
 		newDocsCmd(),
@@ -385,13 +412,27 @@ type emitOpts struct {
 	Records []any
 	// Text renders the human-readable form for --output text.
 	Text func(w io.Writer) error
+	// DefaultFormat overrides what this command emits when the user named no
+	// format and no config default applies — normally JSON off a TTY, a table
+	// on one.
+	//
+	// Exactly one command sets it. `text extract` exists to put a document
+	// into a pipe, and a JSON envelope wrapping the markdown would defeat the
+	// thing it is for. Every other command reports measurements, where the
+	// envelope is the point; a second command reaching for this is a sign the
+	// resolution rule is wrong, not that it needs another exception.
+	DefaultFormat output.Format
 }
 
 // emitResult renders a command result in the resolved output format.
 func emitResult(cmd *cobra.Command, o emitOpts) error {
 	s := getState(cmd)
 	w := cmd.OutOrStdout()
-	f := output.ResolveFormat(s.OutputFormat, os.Stdout.Fd())
+	format := s.OutputFormat
+	if format == "" && o.DefaultFormat != "" {
+		format = string(o.DefaultFormat)
+	}
+	f := output.ResolveFormat(format, os.Stdout.Fd())
 
 	switch f {
 	case output.FormatTOON:

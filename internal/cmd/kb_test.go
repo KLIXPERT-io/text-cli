@@ -145,7 +145,7 @@ func newKBRoot(t *testing.T, st *State) (*cobra.Command, *bytes.Buffer) {
 	pf := root.PersistentFlags()
 	pf.StringVar(&st.OutputFormat, "output", st.OutputFormat, "")
 	pf.StringVar(&st.Lang, "lang", "", "")
-	pf.StringVarP(&st.File, "file", "f", "", "")
+	pf.StringArrayVarP(&st.Files, "file", "f", nil, "")
 	pf.StringVar(&st.InputFormat, "input-format", "text", "")
 	pf.StringVar(&st.TextField, "text-field", "text", "")
 	pf.StringVar(&st.IDField, "id-field", "id", "")
