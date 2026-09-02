@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	cloud.google.com/go/language v1.18.0
 	github.com/BurntSushi/toml v1.6.0
+	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/mod v0.40.0
 	golang.org/x/sys v0.47.0

@@ -561,7 +561,10 @@ func (s *State) docsBody(args []string, flagText string) (string, error) {
 	switch {
 	case flagText == "-":
 		items, err := input.Load(input.Options{
-			File:     "-",
+			Files: []string{"-"},
+			// Never decode here: this is the write path, and the bytes the
+			// user piped in are what lands in the document.
+			From:     input.FromText,
 			Format:   input.FormatText,
 			MaxBytes: s.MaxBytes,
 		})

@@ -180,13 +180,21 @@ func runDiff(cmd *cobra.Command, args []string, metricsFlag string) error {
 }
 
 // dfLoadOne loads a single document from a file path (or "-" for stdin),
-// reusing input.Load so --input-format and --max-bytes behave identically to
-// every other command. The item's id becomes the file's base name (or
-// "stdin"), which is more useful in a diff than the "0" index input.Load
-// hands out for a lone document.
+// reusing input.Load so --input-format, --from and --max-bytes behave
+// identically to every other command — which is also what lets `text diff
+// old.docx new.docx` work without a line of code here. The item's id becomes
+// the file's base name (or "stdin"), which is more useful in a diff than the
+// "0" index input.Load hands out for a lone document.
+//
+// It cannot call State.LoadInput, which resolves one input source and this
+// command needs two named ones — so it applies the strip pass itself, through
+// the same State.stripItems LoadInput uses. Skipping it would make `text diff`
+// the one command that scores markup as prose, and every decoded document
+// arrives here as markdown.
 func dfLoadOne(s *State, path string) (*input.Item, error) {
 	items, err := input.Load(input.Options{
-		File:      path,
+		Files:     []string{path},
+		From:      s.From,
 		Format:    input.Format(s.InputFormat),
 		TextField: s.TextField,
 		IDField:   s.IDField,
@@ -195,6 +203,7 @@ func dfLoadOne(s *State, path string) (*input.Item, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.stripItems(items)
 	it := items[0]
 	if path == "-" {
 		it.ID = "stdin"

@@ -11,10 +11,11 @@ A fast, LLM-friendly Go CLI for text analysis. It reads prose from stdin, a file
 - Also `ndjson` for streams, `csv` for spreadsheets, `table` on a TTY, `text` for humans.
 - Structured errors with machine-readable codes and distinct exit codes — never a stack trace, never a hang. `--fail-under` / `--fail-over` / `--fail-on-findings` turn any of it into a CI gate.
 - Named entities, sentiment, and content classification via the Google Cloud Natural Language API, behind a provider interface built for more backends. Wikipedia lookups via `text kb`, with no credentials at all.
+- **`--file` reads documents, not just text files.** PDF, DOCX, PPTX, ODT, ODS, EPUB and RTF are decoded to markdown before analysis — no `pdftotext`, no `pandoc` — so `text lint --file report.pdf` reports on the file a colleague actually sent, with the heading structure intact. `--file` is repeatable, and binary input that no decoder reads is refused rather than scored.
 - **`--url` reads the web.** `text fetch` scrapes any page to clean prose via Firecrawl, and every analysis command takes `--url` directly — so `text entities --url https://…` works without a pipe. Pages are cached, so analysing one page three ways costs one scrape.
 - **`text docs` works with Google Docs.** Read a document as prose, read the comments on it, reply and resolve, replace a passage, insert a paragraph. A Google Docs URL routes there automatically, so `text lint --url <doc-url>` reports what to fix in a document — and `text docs replace` applies it. Access is granted by sharing the document with the CLI's service account, like a colleague.
 - **`text research`** searches scientific literature (arXiv, PubMed, DOI) and returns abstracts — which are prose, so the rest of the CLI composes straight onto them.
-- Six registries — metrics, entity providers, lint rules, knowledge sources, fetchers, research sources — so a new measurement, rule, or backend is one file that wires itself.
+- Seven registries — metrics, entity providers, lint rules, knowledge sources, fetchers, research sources, document decoders — so a new measurement, rule, backend, or file format is one file that wires itself.
 - Local disk cache with TTLs, so re-running a paid analysis over unchanged text costs nothing.
 - Single static binary, no runtime, no daemon.
 
@@ -140,6 +141,7 @@ Check the [language support table](https://cloud.google.com/natural-language/doc
 | `sentiment` (`sent`) | polarity, magnitude, and a label, optionally per sentence |
 | `classify` (`cls`) | content categories as taxonomy paths |
 | `kb lookup\|search` (`knowledge`) | Wikipedia descriptions and lead paragraphs |
+| `extract` (`convert`, `md`) | a document file as markdown: print it, write it, or pipe it onwards |
 | `fetch` (`scrape`, `read`) | a web page as clean prose, ready for any other command |
 | `docs read\|comments\|comment\|reply\|replace\|insert\|whoami` (`gdocs`) | Google Docs: read, review, and edit |
 | `research papers\|paper\|similar` | scientific literature search, one paper by id, related work |
@@ -204,11 +206,75 @@ text update status
 Input precedence is fixed and identical for every command:
 
 1. `--url <url>` (repeatable) — fetched, then treated exactly like a file
-2. `--file <path>` (or `--file -` for stdin)
+2. `--file <path>` (repeatable; `--file -` for stdin)
 3. positional arguments, joined into one document
 4. stdin, when it is a pipe or a redirect
 
 A terminal stdin with no arguments is an `empty_input` error, not a hang. The CLI never silently waits for a human to type.
+
+### Document formats
+
+`--file report.pdf` works, and so does `cat report.pdf | text readability`. PDF, DOCX, PPTX, ODT, ODS, EPUB and RTF are decoded to markdown before analysis, which means the heading structure survives into the strip pass and the scores match what you would get from the same text pasted in by hand.
+
+| format | extensions | notes |
+|---|---|---|
+| `pdf` | `.pdf` | paragraphs, headings and lists are rebuilt from glyph geometry; running headers and footers are dropped; hyphenation at a line break is rejoined |
+| `docx` | `.docx` `.docm` | headings from paragraph styles, lists, tables |
+| `pptx` | `.pptx` `.pptm` | one heading per slide title, bullets as items; `pages` is the slide count |
+| `odt` | `.odt` `.fodt` | headings, lists, tables |
+| `ods` | `.ods` `.fods` | one heading per sheet, one row per row |
+| `epub` | `.epub` | read in spine order, not archive order |
+| `rtf` | `.rtf` | headings from outline levels, bullets recovered from the list text |
+
+Detection is by extension first, then by content — the extension is what you typed and a magic number is only a guess, and DOCX, PPTX, ODT, ODS and EPUB all share one. So a file named wrongly, or arriving on stdin with no name at all, still decodes. `--from <format>` forces one, and `--from text` turns decoding off entirely:
+
+```bash
+text readability --file bericht.pdf --lang de
+text lint --file rollout.docx --output ndjson
+text readability --file a.docx --file b.epub          # two documents, one call
+text readability --file mislabelled.txt --from docx   # force past a wrong name
+cat deck.pptx | text entities                         # stdin has no name; sniffed
+text readability --file export.latin1.txt --from text # real text, invalid UTF-8
+```
+
+`--file` is repeatable, so a batch of documents is one invocation rather than a shell loop, and each result is keyed by its path rather than by an index.
+
+A binary file that no decoder claims is refused with `invalid_args` rather than scored, because a reading ease computed over a JPEG is a number with no meaning attached to a file the user believed was analysed. A pre-2007 `.doc`, `.xls` or `.ppt` is named as such and told to re-save. `--from text` is the deliberate escape hatch from the sniff and from half the refusal: a latin-1 export is invalid UTF-8 and would otherwise be read as binary, and it is real text. It does not waive the other half — bytes containing a NUL are refused even under `--from text`, because "treat this as text" is a claim about an encoding, not a licence to score a zip.
+
+### Getting the text out: `text extract`
+
+Analysis commands print numbers. `text extract` prints the document — the same markdown they measure, which is what makes it the way to check an extraction before trusting a score computed from it.
+
+```bash
+text extract report.pdf                      # markdown on stdout
+text extract report.pdf > report.md          # …or redirect it
+text extract report.pdf --out report.md      # …or name the destination
+text extract slides.pptx notes.docx --out docs/   # a directory takes one .md each
+text extract report.pdf | text lint          # pipe it into anything
+text extract report.pdf --strip auto         # flat prose instead of markdown
+text extract report.pdf --output json        # the envelope: file, format, title, chars
+```
+
+It is the only command whose default output is text rather than the JSON envelope, because its payload *is* text and an envelope would defeat the pipe it exists to feed. `--output json|ndjson|csv|table` all still work.
+
+`--out` is the one place this CLI writes a file you did not already have. An existing path is refused rather than overwritten; `--force` is how a rerun says it meant it. With several documents `--out` must name a directory, so nothing is silently concatenated or clobbered.
+
+Piping and `--file` are equivalent — `text extract a.pdf | text readability` and `text readability --file a.pdf` produce identical numbers — so prefer `--file`, which is one process instead of two. Reach for `extract` when you want the text itself.
+
+Two failures are worth telling apart. A PDF that is a scan carries no text at all, so it is `empty_input` with a hint saying it needs OCR, which this CLI does not do — not a score of zero. A password-protected PDF is `invalid_args` and says so.
+
+Decoded documents carry `format` and the document's own `title` through to the output as passthrough fields, alongside `file` when more than one source was given. They show up in `--output ndjson`:
+
+```console
+$ text lint --file rollout.docx --output ndjson | head -1
+{"doc_id":"rollout.docx","excerpt":"Einführung","format":"docx","title":"Rollout-Plan",…}
+```
+
+### `--max-bytes` and a document
+
+`--max-bytes` bounds the text that gets **analysed**, and for plain text that is also the read: the reader stops at the limit and `meta.truncated` is set. A container cannot be cut that way — half a zip has no central directory and half a PDF has no xref table — so a document is read whole and `--max-bytes` is applied afterwards, to the markdown the decoder produced, on a rune boundary. A separate, fixed ceiling of 100 MiB bounds the container itself; a file above it is refused outright with `invalid_args` rather than half-read into a decode failure.
+
+A third, fixed bound of 64 MiB applies to what a document may **expand to** while it is being decoded, since a zip-based format compresses far better than it decompresses: a small `.docx` whose body inflates past that is refused with `invalid_args` instead of being unpacked into memory. The same reasoning bounds a PDF's declared page count against the size of the file that declares it.
 
 ### Shared flags
 
@@ -217,14 +283,15 @@ A terminal stdin with no arguments is an `empty_input` error, not a hang. The CL
 | `--output json\|toon\|ndjson\|csv\|table\|text` | default `json`, or `table` when stdout is a terminal |
 | `--strip auto\|markdown\|html\|none` | reduce markup to prose before analysis; default `auto` |
 | `--lang auto\|en\|de` | analysis language; `auto` detects it |
-| `-f, --file <path>` | read the text from a file (`-` for stdin) |
+| `-f, --file <path>` | read the text from a file, decoding a document format if it is one (`-` for stdin); repeatable |
+| `--from auto\|text\|docx\|epub\|ods\|odt\|pdf\|pptx\|rtf` | force the input format; `auto` detects it, `text` disables decoding |
 | `--url <url>` | fetch a web page and analyse it; repeatable |
 | `--fetcher <name>` | backend for `--url` and `text fetch` (default `firecrawl`; a Google Docs URL routes to `gdocs` unless this names one) |
 | `--main-content` | drop nav, headers, and footers from a fetched page (default true) |
 | `--input-format text\|lines\|jsonl` | one document, one per line, or one JSON object per line |
 | `--text-field <name>` | JSONL field holding the text (default `text`) |
 | `--id-field <name>` | JSONL field holding the document id (default `id`) |
-| `--max-bytes <n>` | input size cap (default 10 MiB) |
+| `--max-bytes <n>` | cap on the analysed text (default 10 MiB); a document is decoded whole first, then capped |
 | `--no-cache` | bypass cache reads and writes |
 | `--refresh` | bypass the cache read, still write a fresh result |
 | `--cache-ttl <duration>` | override the TTL for this call |
@@ -765,7 +832,7 @@ The `firecrawl` section is shared by `text fetch`, `--url`, and `text research` 
 
 ## Roadmap / extending
 
-The registries are the point. There are six, and each follows the same rule — **register, don't wire**:
+The registries are the point. There are seven, and each follows the same rule — **register, don't wire**:
 
 | registry | package | what it adds |
 |---|---|---|
@@ -775,16 +842,18 @@ The registries are the point. There are six, and each follows the same rule — 
 | knowledge sources | `internal/knowledge` | a database behind `text kb` and `text entities --enrich` |
 | fetchers | `internal/fetch` | a way to turn a URL into prose, behind `text fetch` and `--url`; optionally claiming the URLs only it can read |
 | research sources | `internal/research` | a literature index behind `text research`, with optional inspect and related-work capabilities |
+| document decoders | `internal/doc` | a file format `--file` can read, decoded to markdown so `internal/strip` stays the one place markup becomes prose |
 
 Each is one file with a `Register` call in `init()`: no command wiring, no switch statement, no list of features repeated anywhere.
 
-Shipped since 0.1.0: the lint engine, `diff`, `sentiment`, `classify`, ten more metrics, Markdown/HTML stripping, TOON output, knowledge-database lookups behind `text kb`, **the web as an input source** (`text fetch`, `--url`) and **literature search** (`text research`) on Firecrawl, and — newest — **Google Docs** (`text docs`), the first feature that writes.
+Shipped since 0.1.0: the lint engine, `diff`, `sentiment`, `classify`, ten more metrics, Markdown/HTML stripping, TOON output, knowledge-database lookups behind `text kb`, **the web as an input source** (`text fetch`, `--url`) and **literature search** (`text research`) on Firecrawl, **Google Docs** (`text docs`), the first feature that writes, and — newest — **document files as an input source** (`--file report.pdf`, `--from`), which closes the same gap for a file that `--url` closed for a page.
 
 Still ahead:
 
 - **More metrics.** Further readability formulas, and measurements beyond readability.
 - **More lint rules**, and rule packs for languages beyond English and German.
 - **More backends.** A second knowledge source (Wikidata, an internal database), a credential-free fetcher for static pages, or a second literature index — each lands as a registration, not a rewrite.
+- **More document formats.** Same registry, same one-file cost. OCR is explicitly not on the list: a scanned PDF is reported as `empty_input` rather than guessed at.
 
 See [docs/EXTENDING.md](./docs/EXTENDING.md) for the extension recipes, with the real signatures from this repo.
 

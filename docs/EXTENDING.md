@@ -2,7 +2,7 @@
 
 This CLI is built to grow. The design rule is **register, don't wire**: a new capability declares itself at init time and every consumer — the commands, `text metrics list`, `text lint rules`, the docs, `--metrics all` — picks it up from the same registry. There is no switch statement to update and no place where a list of features is repeated.
 
-There are **six** registries:
+There are **seven** registries:
 
 | registry | package | adds | discovery command |
 |---|---|---|---|
@@ -12,8 +12,9 @@ There are **six** registries:
 | knowledge sources | [`internal/knowledge`](../internal/knowledge/knowledge.go) | an encyclopedia backend | `--source` hint on error |
 | fetchers | [`internal/fetch`](../internal/fetch/fetch.go) | a URL-to-prose backend | `--fetcher` hint on error |
 | research sources | [`internal/research`](../internal/research/research.go) | a literature index | `--source` hint on error |
+| document decoders | [`internal/doc`](../internal/doc/doc.go) | a file format `--file` can read | `--from` hint on error |
 
-Seven recipes follow — the six registries, then a whole new command. All of them quote the actual signatures in this repo.
+Eight recipes follow — the seven registries, then a whole new command. All of them quote the actual signatures in this repo.
 
 ---
 
@@ -719,7 +720,162 @@ Never add a method to `Source` to accommodate one backend.
 
 ---
 
-## 7. Add a whole new command
+## 7. Add a document decoder
+
+**Cost: one new file. No command wiring.**
+
+A decoder turns the bytes of one file into markdown, so `--file report.pdf` scores the same as the same text pasted in by hand. It is what backs `--file`, `--from`, and the sniff on piped stdin. The interface is in [`internal/doc/doc.go`](../internal/doc/doc.go):
+
+```go
+type Decoder interface {
+	// Name is the stable identifier used by --from and echoed in output.
+	Name() string
+	// Extensions are the lower-case file extensions this decoder owns,
+	// including the leading dot. They are matched before Sniff, because a name
+	// is what the user typed and a magic number is only a guess.
+	Extensions() []string
+	// Sniff reports whether the bytes look like this format. It exists for
+	// stdin, which has no name at all, and for a file named wrongly or not at
+	// all. It must never claim bytes it cannot decode: a false positive turns
+	// a readable text file into a decode error.
+	Sniff(data []byte) bool
+	// Decode reads one document. A file that is not this format at all is
+	// errs.CodeInvalidArgs; a file that is this format but carries no
+	// extractable text is errs.CodeEmptyInput.
+	Decode(data []byte) (*Document, error)
+}
+
+func Register(name string, factory func() (Decoder, error))
+func Open(name string) (Decoder, error)
+func Names() []string          // registered decoders, sorted
+func FormatNames() []string    // "text" plus Names() — what --from accepts
+func Registered(name string) bool
+func Extensions() []string     // every extension any decoder claims, for error hints
+
+// ForFile names the decoder that should read a file, or FormatText if the bytes
+// should be handed straight to the strip pass. path may be empty (stdin).
+func ForFile(path string, data []byte) string
+
+// Decode reads one file with the named decoder. "" or "auto" resolves through
+// ForFile; FormatText returns (nil, nil), meaning "not a document".
+func Decode(format, path string, data []byte) (*Document, error)
+```
+
+`FormatText` (`"text"`) is reserved and cannot be registered: it is what `--from text` means and what `ForFile` returns for a `.md`, `.txt`, or `.html` file. `Decode` returning `(nil, nil)` for it is deliberate — plain text keeps the streaming path in `internal/input`, including its `--max-bytes` truncation, and only a real decode pulls a whole file into memory.
+
+`Document` is what you return, and it is not a document model:
+
+```go
+// Document is one decoded file, reduced to what an analysis command needs.
+// The styles, the images, the revision history and the embedded objects a
+// source format may carry are deliberately absent, because this type feeds a
+// readability score and an entity extractor.
+type Document struct {
+	// Content is the document as markdown. See below for why it is markdown.
+	Content string `json:"content"`
+	// Title is the document's own metadata title, when the format records one
+	// and the author filled it in. It is not the first heading: a made-up
+	// title is worse than none.
+	Title string `json:"title,omitempty"`
+	// Format is the registry name of the decoder that read the file, echoed in
+	// output so a number can be traced back to how the text was obtained.
+	Format string `json:"format,omitempty"`
+	// Pages is the page count for formats that paginate, and 0 for the ones
+	// that do not.
+	Pages int `json:"pages,omitempty"`
+}
+```
+
+`Decode` stamps `Format` for you from `Name()`, so a decoder that forgets to set it is still attributed correctly. Registration is the usual lazy factory:
+
+```go
+func init() {
+	Register("rst", func() (Decoder, error) { return &rstDecoder{}, nil })
+}
+```
+
+The decoder then appears in `--from`, in the `--from` hint on an unknown format, and in the extension list `doc.UnsupportedErr` prints — with no edit anywhere else.
+
+### The one rule: return markdown, not plain text
+
+This is the same rule a fetcher follows, for the same reason. `State.LoadInput` runs every document through `internal/strip`, and that is where a heading becomes a terminated sentence instead of being glued to the paragraph below it. A decoder that flattens its own headings hands the tokenizer one document-sized sentence and quietly ruins every per-sentence average.
+
+Build the output with `mdBuilder` ([`internal/doc/markdown.go`](../internal/doc/markdown.go)) rather than a `strings.Builder`. It exists so the decoders cannot disagree about what a heading looks like, and its `Heading`/`Para`/`Item`/`Row` methods each separate themselves from the previous block — which is the one thing every decoder must get right, because the strip pass can re-encode only the block boundaries that survived the decode. `cleanInline` behind it drops soft hyphens and zero-width marks and folds non-breaking spaces, all of which are invisible to a reader and a word boundary to a tokenizer.
+
+### Worked example
+
+[`internal/doc/pptx.go`](../internal/doc/pptx.go) is the whole pattern at its shortest. The essential parts:
+
+```go
+const FormatPPTX = "pptx"
+
+func init() {
+	Register(FormatPPTX, func() (Decoder, error) { return &pptxDecoder{}, nil })
+}
+
+func (d *pptxDecoder) Name() string { return FormatPPTX }
+
+// Extensions covers the macro-enabled variant too: .pptm is the same OOXML
+// package with a VBA part this decoder never looks at.
+func (d *pptxDecoder) Extensions() []string { return []string{".pptx", ".pptm"} }
+
+// Sniff looks inside, because the PK magic is shared by every OOXML, ODF and
+// EPUB file. ppt/presentation.xml is the part that only a presentation has.
+func (d *pptxDecoder) Sniff(data []byte) bool {
+	if !isZip(data) {
+		return false
+	}
+	r, err := openZip(FormatPPTX, data)
+	if err != nil {
+		return false
+	}
+	return zipHas(r, "ppt/presentation.xml")
+}
+
+func (d *pptxDecoder) Decode(data []byte) (*Document, error) {
+	r, err := openZip(FormatPPTX, data)
+	if err != nil {
+		return nil, err
+	}
+	if !zipHas(r, "ppt/presentation.xml") {
+		return nil, errs.New(errs.CodeInvalidArgs, "not a PowerPoint file: the zip has no ppt/presentation.xml").
+			WithHint("DOCX, ODT and EPUB are zip containers too — use --from auto to detect the real format.")
+	}
+	names := pptxSlideOrder(zipNames(r, pptxSlidePrefix, ".xml"))
+
+	var b mdBuilder
+	for _, name := range names {
+		// ... one heading per slide title, one Item per bullet ...
+	}
+	if b.Empty() {
+		return nil, EmptyErr(FormatPPTX, "")
+	}
+	return &Document{Content: b.String(), Title: pptxCoreTitle(r), Pages: len(names)}, nil
+}
+```
+
+Three things in there are the pattern rather than PowerPoint trivia. `Sniff` opens the container instead of trusting `PK\x03\x04`, because DOCX, PPTX, ODT, ODS and EPUB all start with it. `Decode` re-checks the same marker rather than assuming the caller sniffed, because `--from pptx` forces it past both the extension and the sniff. And a deck is the format where flattening hurts most — the words on a slide are short bullet fragments, and joining them reports a reading level nobody's deck has — so each bullet is its own `Item` and each slide title its own `Heading`.
+
+The zip half is shared: `isZip`, `openZip`, `zipEntry`, `zipHas`, `zipNames`, `newXMLDecoder`, and `localName` live in [`container.go`](../internal/doc/container.go), because four of the six format files here are a zip of XML and only the vocabulary inside differs. RTF shares none of it and is a hand-written parser; PDF shares none of it and reconstructs paragraphs, headings and running furniture from glyph geometry, because a PDF has no document structure to read at all.
+
+### House rules for a decoder
+
+- **`Decode` receives the whole file, never a reader.** A zip reads its central directory from the end and a PDF reads its xref table from the end. The caller has already bounded the size.
+- **Sniff must never claim bytes it cannot decode.** A false positive turns a readable text file into a decode error. The zip-based formats all share one magic number, so each of them looks *inside* the container — `zipHas(r, "word/document.xml")` — before saying yes.
+- **The extension wins over the magic number.** `ForFile` matches `Extensions()` first, because the extension is what the user typed and a sniff is only a guess. Sniffing is the fallback for stdin, which has no name.
+- **Two codes, and they mean different things.** A file that is not this format at all is `errs.CodeInvalidArgs`. A file that *is* this format but carries no extractable text is `errs.CodeEmptyInput` — return `doc.EmptyErr(format, path)`, whose hint says the document needs OCR. Conflating them tells a user to fix the wrong thing.
+- **Every error carries a hint.** The shared container helpers in `container.go` do it too; a code without a next step is a dead end for the caller.
+- **Prefix every unexported identifier with the format name.** All the decoders share one package, so `docxReadTable` and `pptxTable` coexist. Genuinely shared helpers belong in `container.go` or `markdown.go`, once.
+- **`Pages` is 0 unless the format really paginates.** A DOCX has no pages until it is laid out for a printer, so reporting one would be inventing a fact. A PDF page and a PPTX slide are real; an EPUB reflows and is 0.
+- **`Title` is the format's own metadata title, not the first heading.** A made-up title is worse than none.
+- **A library that panics is your problem, not the user's.** The PDF reader panics rather than erroring on a malformed object, so every entry point into it is wrapped by `pdfRecover` and converted to an `*errs.E`. The input is an arbitrary file the user named; a CLI that stack-traces on a truncated download is reporting a bug in itself for a problem in the file.
+- **Partial failure beats refusal where the unit is independent.** One unreadable PDF page costs one page, not the document; every page failing is the error. Do the equivalent for whatever your format's independent unit is, and say so in a comment.
+- **Bound anything an attacker controls.** `epubRead` checks an entry's declared uncompressed size *before* inflating it and charges the real length afterwards, because a crafted archive can declare a size it does not honour. Exceeding the budget is a reported error, never a silent truncation: a readability score over half a book is a wrong number, not a partial one.
+- **Build fixtures in the test, do not check in binaries.** Every decoder here assembles its own zip with `archive/zip`, or its own PDF byte by byte. A binary fixture cannot be reviewed.
+
+---
+
+## 8. Add a whole new command
 
 **Cost: one new file plus one line.**
 
@@ -848,6 +1004,7 @@ Then add `newWordsCmd(),` to the `AddCommand` list. That is the entire wiring.
 | an optional fetcher capability | `internal/fetch/fetch.go` | a new interface the command type-asserts for — never a method on `Fetcher` |
 | a literature index | one file in `internal/research/` | none — `research.Register` in `init()` |
 | an optional research capability | `internal/research/research.go` | a new interface plus a `RequireX` — never a method on `Source` |
+| a file format `--file` can read | one file in `internal/doc/` | none — `doc.Register` in `init()` |
 | a command | one file in `internal/cmd/` | one line in `Execute` |
 | a config key | `internal/config/config.go` | add to the struct, `Get`, `Set`, and `Keys()` |
 | an output format | `internal/output/output.go` | add to `Format`, `Valid`, and the switch in `emitResult` |
