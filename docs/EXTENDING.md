@@ -2,7 +2,7 @@
 
 This CLI is built to grow. The design rule is **register, don't wire**: a new capability declares itself at init time and every consumer — the commands, `text metrics list`, `text lint rules`, the docs, `--metrics all` — picks it up from the same registry. There is no switch statement to update and no place where a list of features is repeated.
 
-There are **seven** registries:
+There are **eight** registries:
 
 | registry | package | adds | discovery command |
 |---|---|---|---|
@@ -12,9 +12,10 @@ There are **seven** registries:
 | knowledge sources | [`internal/knowledge`](../internal/knowledge/knowledge.go) | an encyclopedia backend | `--source` hint on error |
 | fetchers | [`internal/fetch`](../internal/fetch/fetch.go) | a URL-to-prose backend | `--fetcher` hint on error |
 | research sources | [`internal/research`](../internal/research/research.go) | a literature index | `--source` hint on error |
+| data sources | [`internal/data`](../internal/data/data.go) | a structured-data catalogue | `--source` hint on error |
 | document decoders | [`internal/doc`](../internal/doc/doc.go) | a file format `--file` can read | `--from` hint on error |
 
-Eight recipes follow — the seven registries, then a whole new command. All of them quote the actual signatures in this repo.
+Nine recipes follow — the eight registries, then a whole new command. All of them quote the actual signatures in this repo.
 
 ---
 
@@ -720,7 +721,37 @@ Never add a method to `Source` to accommodate one backend.
 
 ---
 
-## 7. Add a document decoder
+## 7. Add a data source
+
+**Cost: one new file. No command wiring.**
+
+A data source is a catalogue of tools that answer with records rather than pages. Listing the catalogue is the only thing every source must do; running a tool is a **capability interface**, the design of `research.PaperInspector`. The interfaces are in [`internal/data/data.go`](../internal/data/data.go):
+
+```go
+type Source interface {
+	Name() string
+	FindTools(ctx context.Context, opts FindOptions) ([]Tool, int, error)
+}
+
+// Optional. A catalogue that can only be browsed stops at Source.
+type Runner interface {
+	RunTool(ctx context.Context, call Call) (*Result, error)
+}
+```
+
+`text data run` never calls `RunTool` directly. It goes through `data.Run`, which settles everything that can refuse the call before the call that costs money: the contact-data rule (`ContactRefusal`), the price — read from the catalogue with `data.Lookup`, which is `FindTools` with a provider and a capability — against the `Budget`, and only then the run. A source therefore has to answer a lookup by id with the tool's `Credits`, `PerRecord`, `Options` and, when its answers are lists, `RecordsKey`.
+
+### House rules for a source
+
+- **Price before paying.** Never add a path that runs a tool without the lookup in front of it. A refusal for price or for contact data must have spent nothing.
+- **Return `Data` verbatim.** `json.RawMessage`, in the provider's key order: a record reads from the name down, and the same record re-encoded through a map opens with whatever sorts first.
+- **Never run the catalogue's own tools.** Alexandria's terms flow is one of its tools; accepting a provider's terms is a person's decision, so `RunTool` refuses the catalogue's provider outright.
+- **Name the idempotency key when a retry might pay twice.** A retriable failure can come after the tool ran and was billed; the request id in the hint is the only way back to that answer.
+- **`TEXT_DATA_CREDIT_CAP` is a ceiling no flag can raise.** `Budget.Ceiling` lowers the default quietly and refuses only a flag that asks past it — so a sandbox capped at 0 still runs free tools.
+
+---
+
+## 8. Add a document decoder
 
 **Cost: one new file. No command wiring.**
 
@@ -875,7 +906,7 @@ The zip half is shared: `isZip`, `openZip`, `zipEntry`, `zipHas`, `zipNames`, `n
 
 ---
 
-## 8. Add a whole new command
+## 9. Add a whole new command
 
 **Cost: one new file plus one line.**
 
@@ -1003,6 +1034,7 @@ Then add `newWordsCmd(),` to the `AddCommand` list. That is the entire wiring.
 | a URL-to-prose backend | one file in `internal/fetch/` | none — `fetch.Register` in `init()` |
 | an optional fetcher capability | `internal/fetch/fetch.go` | a new interface the command type-asserts for — never a method on `Fetcher` |
 | a literature index | one file in `internal/research/` | none — `research.Register` in `init()` |
+| a structured-data catalogue | one file in `internal/data/` | none — `data.Register` in `init()` |
 | an optional research capability | `internal/research/research.go` | a new interface plus a `RequireX` — never a method on `Source` |
 | a file format `--file` can read | one file in `internal/doc/` | none — `doc.Register` in `init()` |
 | a command | one file in `internal/cmd/` | one line in `Execute` |
