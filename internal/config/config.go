@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,8 +39,8 @@ type Entities struct {
 }
 
 // Firecrawl holds the credential shared by every Firecrawl-backed feature: the
-// page fetcher and the research source. It is one section rather than a key
-// under each because it is one account and one quota.
+// page fetcher, the research source and the data tools. It is one section
+// rather than a key under each because it is one account and one quota.
 type Firecrawl struct {
 	APIKey string `toml:"api_key"`
 	// BaseURL points at a self-hosted Firecrawl. Empty uses the public API.
@@ -64,12 +65,20 @@ type Research struct {
 	Source string `toml:"source"`
 }
 
+// Data names the catalogue `text data` asks, and the most one run may cost
+// before --max-credits has to raise it. MaxCredits 0 allows free tools only.
+type Data struct {
+	Source     string `toml:"source"`
+	MaxCredits int    `toml:"max_credits"`
+}
+
 type Cache struct {
 	Dir         string `toml:"dir"`
 	DefaultTTL  string `toml:"default_ttl"`
 	TTLEntities string `toml:"ttl_entities"`
 	TTLFetch    string `toml:"ttl_fetch"`
 	TTLResearch string `toml:"ttl_research"`
+	TTLData     string `toml:"ttl_data"`
 }
 
 type Logging struct {
@@ -84,6 +93,7 @@ type Config struct {
 	Docs       Docs      `toml:"docs"`
 	Fetch      Fetch     `toml:"fetch"`
 	Research   Research  `toml:"research"`
+	Data       Data      `toml:"data"`
 	Cache      Cache     `toml:"cache"`
 	Logging    Logging   `toml:"logging"`
 	AutoUpdate bool      `toml:"auto_update"`
@@ -91,17 +101,23 @@ type Config struct {
 	path string
 }
 
+// DefaultDataMaxCredits is data.max_credits until it is set. It mirrors
+// data.DefaultMaxCredits rather than importing it, for the reason validOutput
+// mirrors output.Valid: this package sits below the ones it configures.
+const DefaultDataMaxCredits = 30
+
 // Default returns built-in defaults.
 //
-// fetch.provider and research.source are deliberately empty rather than
-// "firecrawl": the registries resolve an unset name to their single registered
-// backend, so a config written today does not pin a choice that a second
-// backend would need to un-pin.
+// fetch.provider, research.source and data.source are deliberately empty
+// rather than naming a backend: the registries resolve an unset name to their
+// single registered backend, so a config written today does not pin a choice
+// that a second backend would need to un-pin.
 func Default() *Config {
 	return &Config{
 		Defaults:   Defaults{Output: "", Lang: "auto", Metrics: "auto"},
 		Entities:   Entities{Provider: "google"},
-		Cache:      Cache{DefaultTTL: "24h", TTLEntities: "24h", TTLFetch: "24h", TTLResearch: "24h"},
+		Data:       Data{MaxCredits: DefaultDataMaxCredits},
+		Cache:      Cache{DefaultTTL: "24h", TTLEntities: "24h", TTLFetch: "24h", TTLResearch: "24h", TTLData: "24h"},
 		Logging:    Logging{Format: "text"},
 		AutoUpdate: true,
 	}
@@ -205,6 +221,11 @@ func (c *Config) FetchTTL() time.Duration { return parseTTL(c.Cache.TTLFetch, 24
 // is immutable and the index moves in days, not minutes.
 func (c *Config) ResearchTTL() time.Duration { return parseTTL(c.Cache.TTLResearch, 24*time.Hour) }
 
+// DataTTL returns the cache TTL for data-tool answers. A run is billed, and a
+// company's profile or a person's roles do not change by the hour; --refresh
+// buys a fresh answer when one has.
+func (c *Config) DataTTL() time.Duration { return parseTTL(c.Cache.TTLData, 24*time.Hour) }
+
 func parseTTL(v string, fallback time.Duration) time.Duration {
 	d, err := time.ParseDuration(strings.TrimSpace(v))
 	if err != nil || d <= 0 {
@@ -238,6 +259,10 @@ func (c *Config) Get(key string) (string, bool) {
 		return c.Fetch.Provider, true
 	case "research.source":
 		return c.Research.Source, true
+	case "data.source":
+		return c.Data.Source, true
+	case "data.max_credits":
+		return strconv.Itoa(c.Data.MaxCredits), true
 	case "cache.dir":
 		return c.Cache.Dir, true
 	case "cache.default_ttl":
@@ -248,6 +273,8 @@ func (c *Config) Get(key string) (string, bool) {
 		return c.Cache.TTLFetch, true
 	case "cache.ttl_research":
 		return c.Cache.TTLResearch, true
+	case "cache.ttl_data":
+		return c.Cache.TTLData, true
 	case "logging.verbose":
 		return fmt.Sprintf("%v", c.Logging.Verbose), true
 	case "logging.format":
@@ -286,6 +313,14 @@ func (c *Config) Set(key, value string) error {
 		c.Fetch.Provider = value
 	case "research.source":
 		c.Research.Source = value
+	case "data.source":
+		c.Data.Source = value
+	case "data.max_credits":
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || n < 0 {
+			return fmt.Errorf("data.max_credits must be a whole number of credits, 0 or more")
+		}
+		c.Data.MaxCredits = n
 	case "cache.dir":
 		c.Cache.Dir = value
 	case "cache.default_ttl":
@@ -308,6 +343,11 @@ func (c *Config) Set(key, value string) error {
 			return fmt.Errorf("invalid duration: %q", value)
 		}
 		c.Cache.TTLResearch = value
+	case "cache.ttl_data":
+		if _, err := time.ParseDuration(value); err != nil {
+			return fmt.Errorf("invalid duration: %q", value)
+		}
+		c.Cache.TTLData = value
 	case "logging.verbose":
 		c.Logging.Verbose = value == "true" || value == "1"
 	case "logging.format":
@@ -349,11 +389,14 @@ func Keys() []string {
 		"docs.service_account_path",
 		"fetch.provider",
 		"research.source",
+		"data.source",
+		"data.max_credits",
 		"cache.dir",
 		"cache.default_ttl",
 		"cache.ttl_entities",
 		"cache.ttl_fetch",
 		"cache.ttl_research",
+		"cache.ttl_data",
 		"logging.verbose",
 		"logging.format",
 		"auto_update",
