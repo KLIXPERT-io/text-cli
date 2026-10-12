@@ -44,6 +44,14 @@ func TestTranslateMapsStatusToCode(t *testing.T) {
 			want:   errs.CodeAuthDenied,
 		},
 		{
+			name:    "403 for unaccepted data terms names the provider, not the key",
+			status:  http.StatusForbidden,
+			body:    `{"success":false,"error":"Provider terms must be accepted.","code":"THIRD_PARTY_DATA_TERMS_REQUIRED","requiresAction":{"type":"accept_terms","terms":"apollo","version":"1","url":"https://www.firecrawl.dev/app/settings?tab=data-sources"}}`,
+			hadKey:  true,
+			want:    errs.CodeAuthDenied,
+			wantMsg: "apollo data terms",
+		},
+		{
 			name:   "402 is out of credits, not a rate limit",
 			status: http.StatusPaymentRequired,
 			body:   `{"success":false,"error":"Insufficient credits"}`,
@@ -277,6 +285,37 @@ func TestClientOmitsAuthorizationWithoutAKey(t *testing.T) {
 	}
 	if hadAuth {
 		t.Fatal("an Authorization header was sent without a key")
+	}
+}
+
+func TestPostIdempotentSendsTheKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		requestID string
+		want      string
+		wantSent  bool
+	}{
+		{name: "a key is sent as x-request-id", requestID: "session-1:call-2", want: "session-1:call-2", wantSent: true},
+		{name: "an empty key sends no header", requestID: "  ", wantSent: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			var sent bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, sent = r.Header["X-Request-Id"]
+				got = r.Header.Get("X-Request-Id")
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer srv.Close()
+
+			if err := New("fc-test", srv.URL).PostIdempotent(context.Background(), "/v2/scrape", tc.requestID, map[string]any{}, nil); err != nil {
+				t.Fatalf("PostIdempotent errored: %v", err)
+			}
+			if sent != tc.wantSent || got != tc.want {
+				t.Errorf("x-request-id sent = %v (%q), want %v (%q)", sent, got, tc.wantSent, tc.want)
+			}
+		})
 	}
 }
 

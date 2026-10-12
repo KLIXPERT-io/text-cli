@@ -179,6 +179,7 @@ Errors are a single JSON line on **stderr**, in every output format:
 |---|---|
 | `entities`, `sentiment`, `classify` | `--service-account`, `TEXT_SERVICE_ACCOUNT`, `GOOGLE_APPLICATION_CREDENTIALS`, config `entities.service_account_path`, then Application Default Credentials |
 | `fetch`, `--url` on a web page | `FIRECRAWL_API_KEY`, then config `firecrawl.api_key` |
+| `data find`, `data tool`, `data run` | `FIRECRAWL_API_KEY`, then config `firecrawl.api_key` — only `run` spends credits |
 | `docs`, `--url` on a Google Doc | `--service-account`, `TEXT_SERVICE_ACCOUNT`, `GOOGLE_APPLICATION_CREDENTIALS`, config `docs.service_account_path`, then config `entities.service_account_path` — **plus the document shared with that service account** |
 
 `readability`, `lint`, `diff`, `metrics`, `kb`, and `research` need **no credentials at all**.

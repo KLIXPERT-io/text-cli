@@ -15,7 +15,8 @@ A fast, LLM-friendly Go CLI for text analysis. It reads prose from stdin, a file
 - **`--url` reads the web.** `text fetch` scrapes any page to clean prose via Firecrawl, and every analysis command takes `--url` directly — so `text entities --url https://…` works without a pipe. Pages are cached, so analysing one page three ways costs one scrape.
 - **`text docs` works with Google Docs.** Read a document as prose, read the comments on it, reply and resolve, replace a passage, insert a paragraph. A Google Docs URL routes there automatically, so `text lint --url <doc-url>` reports what to fix in a document — and `text docs replace` applies it. Access is granted by sharing the document with the CLI's service account, like a colleague.
 - **`text research`** searches scientific literature (arXiv, PubMed, DOI) and returns abstracts — which are prose, so the rest of the CLI composes straight onto them.
-- Seven registries — metrics, entity providers, lint rules, knowledge sources, fetchers, research sources, document decoders — so a new measurement, rule, backend, or file format is one file that wires itself.
+- **`text data`** reaches records a page only paraphrases — a company's profile and filings, a person's roles, an economic series, a website's traffic — through Firecrawl's Alexandria catalogue. Finding a tool is free; a run is priced before it is paid for, refused above a credit ceiling, and cached.
+- Eight registries — metrics, entity providers, lint rules, knowledge sources, fetchers, research sources, data sources, document decoders — so a new measurement, rule, backend, or file format is one file that wires itself.
 - Local disk cache with TTLs, so re-running a paid analysis over unchanged text costs nothing.
 - Single static binary, no runtime, no daemon.
 
@@ -127,6 +128,8 @@ Self-hosting Firecrawl? Point the CLI at it with `text config set firecrawl.base
 
 `text research` uses the same account but does **not** require a key — the literature index answers unauthenticated requests. Setting one raises your rate limit.
 
+`text data` uses the same account **and does require the key**: finding a tool is free, but every `run` spends the account's credits.
+
 Check the [language support table](https://cloud.google.com/natural-language/docs/languages) before trusting output in a long-tail language. The v1 API rejects a language it does not support with an error rather than answering best-effort, so for the Google backend `language_supported` in the response is always `true`; the field stays in the contract for providers that report it.
 
 ## Usage
@@ -145,6 +148,7 @@ Check the [language support table](https://cloud.google.com/natural-language/doc
 | `fetch` (`scrape`, `read`) | a web page as clean prose, ready for any other command |
 | `docs read\|comments\|comment\|reply\|replace\|insert\|whoami` (`gdocs`) | Google Docs: read, review, and edit |
 | `research papers\|paper\|similar` | scientific literature search, one paper by id, related work |
+| `data find\|tool\|run` | structured-data tools: which fit a question, what one takes, and its answer (billed) |
 | `config get\|set\|list\|path` | configuration |
 | `update status\|check\|apply` | self-update |
 
@@ -196,6 +200,11 @@ text docs reply <doc-url> <comment-id> "done" --resolve
 text research papers "how is text readability measured?"
 text research paper arxiv:1706.03762 --query "what is the attention mechanism?"
 text research similar arxiv:1706.03762 --intent "cheaper attention variants"
+
+# Structured data (Firecrawl API key required; only run costs credits)
+text data find "a company's profile from its domain"
+text data tool fullenrich/companies/lookup
+text data run fullenrich/companies/lookup --opt domain=example.com
 
 # Config and self-update
 text config path
@@ -565,6 +574,37 @@ text research papers "sepsis biomarkers" --limit 25 --output ndjson |
   jq -r .abstract | text entities --input-format lines --aggregate --top 20
 ```
 
+## Data: records, not pages
+
+Some facts live in a database rather than on a page: a company's founding year and headcount, a listed company's income statement, where a person works now and what they did before, an economic series, the sites that send a domain its traffic. `text data` reaches them through [Firecrawl's Alexandria](https://www.firecrawl.dev/alexandria) catalogue — well over a thousand tools from a few hundred providers.
+
+```bash
+# Which tools fit — free, nothing runs
+text data find "a listed company's income statement"
+text data find --site https://www.linkedin.com/in/someone
+text data find --provider fred --limit 50
+
+# One tool in full: price, required inputs, every option — free
+text data tool fiscal-ai/financials/income-statement
+
+# Run it — billed at the listed price, cached for 24h
+text data run fiscal-ai/financials/income-statement --opt ticker=MSFT
+text data run fullenrich/people/lookup --opt person_name="Ada Example" --opt company_domain=example.com
+text data run fred/series/search --options '{"search_text":"unemployment rate","limit":5}' --output ndjson
+```
+
+**Describe the data, not the entity.** The catalogue matches by meaning, and loosely: "a person's profile and career history" finds the people tools, a bare name finds tools that search social posts for it, and "employer and job history" finds job boards.
+
+**A run is priced before it is paid for.** The price comes from the catalogue first, and a tool listed above the ceiling — 30 credits unless `data.max_credits` says otherwise — is refused there, with nothing spent (`quota_exceeded`, exit 3). Raise it for one run with `--max-credits`. Prices are per call or, for a search, per record returned.
+
+**Contact data is refused.** Tools that look up a person's email address or phone number, and `reveal_*` options that switch it on elsewhere, are refused before anything is sent (`invalid_args`).
+
+**A run can be retried without paying twice.** A run that times out or fails upstream may still have been billed, so its error names the request id it went out under; rerunning with `--request-id <that id>` is answered from the first attempt instead of running the tool again. A completed answer is cached on the tool and its options, so reading it again — in any output format — is free; `--refresh` buys a fresh one.
+
+**An agent sandbox can be capped.** `TEXT_DATA_CREDIT_CAP` sets a ceiling no flag can raise: with it at `0`, free tools still run and `--max-credits 50` is refused. Set it wherever an agent drives the CLI with the account's key in its environment.
+
+`data` is the provider's answer verbatim, in the provider's key order. With `--output ndjson` a tool that returns a list — people, companies, series — prints one record per line, split on the member the catalogue names in `records_key`. A provider that has nobody by that name is `not_found` (exit 4), and per-record tools charge nothing for it. A provider's terms that an admin has not yet accepted are `auth_denied` (exit 2), with the dashboard page in the hint; the CLI never accepts terms itself.
+
 ## Pipelines
 
 `text` is built to sit in the middle of a pipe. Real, copy-pasteable examples:
@@ -810,12 +850,17 @@ service_account_path = "~/secrets/text-sa.json"   # empty falls back to [entitie
 [research]
 # source = "firecrawl"      # empty lets the registry pick
 
+[data]
+# source = "alexandria"     # empty lets the registry pick
+max_credits = 30            # most a run may cost before --max-credits has to raise it; 0 = free tools only
+
 [cache]
 # dir = "~/custom/cache"   # default: <config dir>/cache
 default_ttl = "24h"
 ttl_entities = "24h"
 ttl_fetch = "24h"
 ttl_research = "24h"
+ttl_data = "24h"
 
 [logging]
 verbose = false

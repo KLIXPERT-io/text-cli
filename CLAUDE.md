@@ -29,6 +29,9 @@ internal/gdocs/                Google Docs: Docs API for text, Drive API for
 internal/research/             research-source registry + Firecrawl papers
                                  backend; SearchPapers is required, inspect and
                                  related-work are capability interfaces
+internal/data/                 data-source registry + Firecrawl Alexandria
+                                 backend; FindTools is required, running is the
+                                 Runner capability; Run prices before it pays
 internal/doc/                  document decoders: doc.go (registry, Document,
                                  binary detection), container.go (the shared zip
                                  + XML helpers), markdown.go (mdBuilder — the
@@ -47,18 +50,18 @@ internal/errs/                 structured errors and exit codes
 internal/cache/                disk cache with TTLs
 internal/logging/              stderr logging
 internal/update/               self-updater
-docs/EXTENDING.md              the eight extension recipes — read before adding anything
+docs/EXTENDING.md              the nine extension recipes — read before adding anything
 skills/text-cli/                agent skill shipped with the CLI:
                                  SKILL.md is the router (loaded always) and
                                  references/*.md one file per capability
                                  (loaded on demand)
 ```
 
-Commands: `readability`, `lint` (+ `lint rules`), `diff`, `extract`, `metrics`, `entities`, `sentiment`, `classify`, `kb` (+ `lookup`, `search`), `fetch`, `docs` (+ `read`, `comments`, `comment`, `reply`, `replace`, `insert`, `whoami`), `research` (+ `papers`, `paper`, `similar`), `config`, `update`.
+Commands: `readability`, `lint` (+ `lint rules`), `diff`, `extract`, `metrics`, `entities`, `sentiment`, `classify`, `kb` (+ `lookup`, `search`), `fetch`, `docs` (+ `read`, `comments`, `comment`, `reply`, `replace`, `insert`, `whoami`), `research` (+ `papers`, `paper`, `similar`), `data` (+ `find`, `tool`, `run`), `config`, `update`.
 
 ## The one rule: register, don't wire
 
-New capabilities declare themselves; nothing enumerates them. There are **seven** registries, and they all work the same way:
+New capabilities declare themselves; nothing enumerates them. There are **eight** registries, and they all work the same way:
 
 - **A metric** — one file in `internal/analyze/readability/` (or a new package under `internal/analyze/`) with `analyze.Register(analyze.Metric{...})` in `init()`. It then appears in `text metrics list`, in `--metrics all`, and in `--metrics auto` for its declared languages.
   **The one manual step:** add it to the `directions` table in `internal/analyze/readability/wstf.go`. `readability.DirectionOf` is what `text diff` and the `--fail-under` / `--fail-over` gates read to decide whether up or down is better; a metric missing from it is silently skipped by a gate. `TestDirectionOf` walks `analyze.All()` and fails the build if you forget.
@@ -68,6 +71,7 @@ New capabilities declare themselves; nothing enumerates them. There are **seven*
 - **A fetcher** — one file in `internal/fetch/` with `fetch.Register(name, factory)` in `init()`. Backs `text fetch` and the global `--url`. **It must return markdown, not plain text**: `State.LoadInput` runs every document through `internal/strip`, and a backend that pre-flattens hands the tokenizer a heading glued to the next sentence. That is what makes `--url` and `text fetch … | text …` produce identical scores and identical byte offsets. Credentials arrive via capability interfaces, never via `Options`: `APIConfigurer` for an API key, `ServiceAccountConfigurer` for a Google key file. Two more capabilities live here: `URLMatcher` lets a backend claim the URLs only it can read (`fetch.ForURL`, how a Google Docs URL reaches the `gdocs` backend instead of the scraper), and `CacheTTLHinter` lets a backend opt out of the page cache (`gdocs` returns 0 — free to read, and mutable).
 - **A document decoder** — one file in `internal/doc/` with `doc.Register(name, factory)` in `init()`. Backs `--file report.pdf`, `--from`, and the sniff on stdin; shipped: `pdf`, `docx`, `pptx`, `odt`, `ods`, `epub`, `rtf`. **It must return markdown, not plain text**, for exactly the reason a fetcher must: `State.LoadInput` runs every document through `internal/strip`, and a decoder that flattens its own headings hands the tokenizer one document-sized sentence. Build the output with `mdBuilder` (`markdown.go`), never a bare `strings.Builder` — it is the one definition of what a heading looks like, and its `Heading`/`Para`/`Item`/`Row` methods each separate themselves from the previous block, which is the only thing the strip pass cannot recover if a decoder gets it wrong. `Extensions()` is matched before `Sniff()` by `doc.ForFile`, because an extension is what the user typed and a magic number is only a guess — and because the four zip-based formats share one. Two error codes and they are not interchangeable: a file that is not this format is `invalid_args`, a file that *is* this format but holds no text is `doc.EmptyErr` (`empty_input`, "it needs OCR"). Every unexported identifier is prefixed with the format name, because all the decoders share one package.
 - **A research source** — one file in `internal/research/` with `research.Register(name, factory)` in `init()`. `SearchPapers` is the only required method; `PaperInspector` and `SimilarFinder` are capability interfaces, asked for via `RequireInspector` / `RequireSimilarFinder`. Never add a method to `Source`.
+- **A data source** — one file in `internal/data/` with `data.Register(name, factory)` in `init()`. `FindTools` is the only required method; running a tool is the `Runner` capability interface, asked for via `RequireRunner`. Commands go through `data.Run`, never `RunTool` directly. Never add a method to `Source`.
 
 Every factory must stay cheap — no clients, no credentials, no network; `Open` calls it lazily, and `SentimentProviders()` constructs every registered provider just to type-assert on it.
 
@@ -92,7 +96,8 @@ If you find yourself editing more than one file to add a feature of these kinds,
 - **Tests are table-driven.** One `tests := []struct{...}` slice, `t.Run(tc.name, ...)`, cases named for the behaviour they pin. Test the `internal/` package, not the cobra command, wherever the logic can be lifted out of `RunE`.
 - **Language gates are load-bearing.** A metric's or rule's `Languages` field is what stops German prose being scored with English constants. Set it honestly; use `AnyLanguage` (`"*"`) only for genuinely language-agnostic work.
 - **Do not clamp scores**, only band labels — and only where the scale really ends. Reading ease clamps to 0–100 for the *label*; grade levels do not clamp, and a WSTF outside 4–15 is labelled `unter der Skala` / `über der Skala` rather than pretending to be `sehr leicht`.
-- **Paid calls are cached on the provider's inputs, never on the filters.** `entities`/`sentiment`/`classify` key on (provider, language, text), so changing `--top`, `--types`, or `--min-salience` re-filters a cached payload instead of paying again. `fetch` keys on (fetcher, URL, main-content, links) — deliberately *not* on `MaxAge`, which bounds staleness in Firecrawl's cache rather than in this one; including it would write two entries for one page. Keep it that way.
+- **Paid calls are cached on the provider's inputs, never on the filters.** `entities`/`sentiment`/`classify` key on (provider, language, text), so changing `--top`, `--types`, or `--min-salience` re-filters a cached payload instead of paying again. `fetch` keys on (fetcher, URL, main-content, links) — deliberately *not* on `MaxAge`, which bounds staleness in Firecrawl's cache rather than in this one; including it would write two entries for one page. Keep it that way. `data run` keys on (source, tool, options as canonical JSON) — the request id is not part of it.
+- **A data run is priced before it is paid for.** `data.Run` refuses contact-data tools, reads the tool's price from the catalogue (free) and refuses it above the `Budget` before `RunTool` is called; a refusal must have spent nothing. `TEXT_DATA_CREDIT_CAP` is a ceiling no flag can raise, for sandboxes where an agent types the flags. The catalogue's own tools — the terms flow among them — are never run: accepting a provider's terms is a person's decision.
 - **A 404 from Google means "share it with me".** Google answers a request for a document the caller cannot see with 404 rather than 403, so an id cannot be probed for existence. Reported literally that reads as "not found" for a document the user has open in another tab. `internal/gdocs` turns it into a `not_found` whose hint names the service account address and asks for the document to be shared. Every access failure in that package ends there, and `text docs whoami` prints the same address on demand — a service account has no consent screen and cannot request access.
 - **Credentials come from the environment and the config, never from a flag.** There is no `--api-key`: a secret on the command line lands in shell history and in the process list. `config.Secret`/`config.Redact` fingerprint the key in `text config list`, because that output is what people paste into bug reports; `config get` still returns it in full.
 - **German is domain vocabulary, not localisation.** Amstad and WSTF level labels, and the German lint messages and suggestions, stay in German because that is what the formulas and the style guides call them. Do not translate them and do not add an i18n layer.

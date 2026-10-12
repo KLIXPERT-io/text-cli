@@ -1,13 +1,15 @@
 // Package firecrawl is the shared transport for every Firecrawl-backed feature.
 //
-// It exists so the two capabilities built on Firecrawl — the page fetcher in
-// internal/fetch and the paper search in internal/research — do not each grow
-// their own HTTP client, their own key resolution, and their own idea of what a
-// 429 means. Those two packages own their request and response shapes; this one
-// owns the wire.
+// It exists so the capabilities built on Firecrawl — the page fetcher in
+// internal/fetch, the paper search in internal/research, and the data tools in
+// internal/data — do not each grow their own HTTP client, their own key
+// resolution, and their own idea of what a 429 means. Those packages own their
+// request and response shapes; this one owns the wire.
 //
-// It deliberately knows nothing about pages or papers. Adding a third Firecrawl
-// capability should mean a new package with a Register call, not a change here.
+// It deliberately knows nothing about pages, papers or tools. Adding a
+// Firecrawl capability should mean a new package with a Register call, not a
+// change here — except where the wire itself grows, as it did for the
+// idempotency key and the terms refusal the data tools brought with them.
 package firecrawl
 
 import (
@@ -117,15 +119,29 @@ func RequireKey(key string) error {
 
 // Get performs a GET and decodes the JSON body into out.
 func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
-	return c.do(ctx, http.MethodGet, path, query, nil, out)
+	return c.do(ctx, http.MethodGet, path, query, nil, nil, out)
 }
 
 // Post performs a POST with a JSON body and decodes the JSON response into out.
 func (c *Client) Post(ctx context.Context, path string, body, out any) error {
-	return c.do(ctx, http.MethodPost, path, nil, body, out)
+	return c.do(ctx, http.MethodPost, path, nil, nil, body, out)
 }
 
-func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, out any) error {
+// PostIdempotent is Post under an idempotency key, sent as x-request-id.
+//
+// Firecrawl answers a repeated key with the original response instead of
+// executing — and billing — the call again, which is what makes retrying a
+// paid call safe: the caller sends the same key twice and is charged once. An
+// empty key sends none.
+func (c *Client) PostIdempotent(ctx context.Context, path, requestID string, body, out any) error {
+	var header http.Header
+	if id := strings.TrimSpace(requestID); id != "" {
+		header = http.Header{"X-Request-Id": []string{id}}
+	}
+	return c.do(ctx, http.MethodPost, path, nil, header, body, out)
+}
+
+func (c *Client) do(ctx context.Context, method, path string, query url.Values, header http.Header, body, out any) error {
 	u := c.BaseURL + "/" + strings.TrimLeft(path, "/")
 	if len(query) > 0 {
 		u += "?" + query.Encode()
@@ -158,6 +174,11 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+	for name, values := range header {
+		for _, v := range values {
+			req.Header.Add(name, v)
+		}
+	}
 
 	client := c.HTTP
 	if client == nil {
@@ -210,7 +231,18 @@ type apiError struct {
 		Message string   `json:"message"`
 		Path    []string `json:"path"`
 	} `json:"details"`
+	// RequiresAction accompanies a refusal a person has to resolve — today
+	// only codeTermsRequired, where URL is the dashboard page the terms are
+	// accepted on.
+	RequiresAction *struct {
+		Terms string `json:"terms"`
+		URL   string `json:"url"`
+	} `json:"requiresAction"`
 }
+
+// codeTermsRequired is the 403 a data provider answers with until an admin of
+// the Firecrawl account has accepted its terms.
+const codeTermsRequired = "THIRD_PARTY_DATA_TERMS_REQUIRED"
 
 // message renders the most specific description available. The details array
 // is what names the offending parameter ("k is only valid when query is
@@ -257,6 +289,18 @@ func translate(status int, raw []byte, retryAfter string, hadKey bool) *errs.E {
 	}
 
 	switch {
+	// Before the generic 403: the key is fine, and the fix is a person
+	// accepting a provider's terms — which must never be done on their behalf,
+	// so the hint names the page rather than an API call.
+	case status == http.StatusForbidden && api.Code == codeTermsRequired && api.RequiresAction != nil:
+		terms := strings.TrimSpace(api.RequiresAction.Terms)
+		if terms == "" {
+			terms = "the provider's"
+		}
+		return errs.Newf(errs.CodeAuthDenied, "Firecrawl needs the %s data terms accepted before this tool can run", terms).
+			WithHint("An admin of the Firecrawl account accepts them at " + api.RequiresAction.URL +
+				". Ask them to; do not accept terms on someone's behalf. Then retry.")
+
 	case status == http.StatusUnauthorized, status == http.StatusForbidden:
 		if !hadKey {
 			return errs.Newf(errs.CodeAuthMissing, "Firecrawl rejected an unauthenticated request: %s", msg).

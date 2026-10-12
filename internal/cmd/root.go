@@ -353,6 +353,7 @@ It reads text in and writes data out, so it composes:
 		newFetchCmd(),
 		newDocsCmd(),
 		newResearchCmd(),
+		newDataCmd(),
 		newConfigCmd(),
 		newUpdateCmd(version),
 	)
